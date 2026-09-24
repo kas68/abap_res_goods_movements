@@ -1,0 +1,1 @@
+# abap_res_goods_movements
