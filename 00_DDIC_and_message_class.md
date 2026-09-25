@@ -26,10 +26,9 @@
 | 013 | Next run scheduled at &1 &2 |
 | 014 | Plant &1 does not exist |
 | 015 | Storage location &1 does not exist for plant &2 |
-| 016 | Plants &1 and &2 must belong to the same company code |
-| 017 | Order &1: drift – received &2 but only &3 transferred |
-| 018 | Order &1: no reservation authorisation for plants &2/&3, mvt &4 |
-| 019 | Requirement date &1 is in the past |
+| 016 | RM plants required and must differ (source &1 / target &2) |
+| 017 | Order &1 component &2: 301 RM reservation &3 created (shortage &4) |
+| 018 | No authorization for movement 301 in plant &1 |
 | 020 | GR &1/&2 item &3: 301 transfer &4 posted |
 | 021 | GR &1/&2 item &3: transfer already posted – skipped |
 | 022 | GR &1/&2 item &3: no valuation type for fiscal year &4 |
@@ -37,9 +36,6 @@
 | 024 | GR &1/&2 item &3: 301 posting error – &4 |
 | 025 | GR &1/&2 item &3: reversal 302 posted |
 | 026 | Automation inactive for plant pair &1 / &2 |
-| 027 | GR &1/&2 item &3: no posting authorisation (plants / mvt type, dest. &4) |
-| 028 | Self-reschedule is only possible in catch-up mode (C) |
-| 029 | Commit failed for order &1 |
 
 ---
 
@@ -54,24 +50,23 @@ Notes: all tables are client-dependent (`MANDT` first key). Delivery class `A`
 |---|:---:|---|---|
 | MANDT | X | MANDT | Client |
 | AUFNR | X | AUFNR | Production order |
-| POSNR | X | CO_POSNR | Order item |
+| RES_KIND | X | CHAR1 | H = header material (8P01→8Q01) / R = raw-material component (8Q01→8P01) |
+| POSNR | X | CO_POSNR | Header item (0001) or component item (RESB-RSPOS) |
 | RUN_ID | X | SYSUUID_C32 (CHAR32) | Run identifier (FK → ZMM_301_RUN_LOG) |
 | RSNUM | | RSNUM | Reservation number |
 | RSPOS | | RSPOS | Reservation item |
-| WERKS_FR | | WERKS_D | Origin plant |
-| WERKS_TO | | WERKS_D | Destination plant |
-| MATNR | | MATNR | Header material |
-| PO_OPEN | | MENGE_D | PO open qty (PSMNG − WEMNG) |
+| WERKS_FR | | WERKS_D | Issuing plant (H: 8P01 / R: 8Q01) |
+| WERKS_TO | | WERKS_D | Receiving plant (H: 8Q01 / R: 8P01) |
+| MATNR | | MATNR | Header material (H) or component material (R) |
+| PO_OPEN | | MENGE_D | Reserved basis qty (H: PSMNG−WEMNG / R: shortage) |
 | RES_BDMNG | | MENGE_D | Reservation requirement qty |
 | RES_ENMNG | | MENGE_D | Reservation withdrawn/transferred qty |
 | MEINS | | MEINS | Base unit |
-| STATUS | | CHAR1 | C=Created / R=Realigned / X=Closed / N=Unchanged / F=Complete / K=Fully received / S=Simulated / E=Error |
+| STATUS | | CHAR1 | C=Created / R=Realigned / X=Closed / N=Unchanged / F=Complete / K=Skipped(fully received/no shortage) / E=Error / S=Simulated (see FS §7.3) |
 | MESSAGE | | STRING | Message text |
 | ERDAT | | ERDAT | Created on |
 | ERZET | | ERZET | Created at |
 | ERNAM | | ERNAM | Created by |
-
-Secondary index `Z01` on `AUFNR, POSNR, ERDAT, ERZET` (latest-link read).
 
 ### 2.2 `ZMM_301_RUN_LOG` — execution log (FS-MM-301RES-001)
 
@@ -110,7 +105,7 @@ Secondary index `Z01` on `AUFNR, POSNR, ERDAT, ERZET` (latest-link read).
 | ERNAM | | ERNAM | Executed by |
 | MESSAGE | | STRING | Summary / abort reason |
 
-### 2.3 `ZMM_301_CTRL` — control/config (FS-MM-301MOV-001) — SM30 maintenance view `ZMM_301_CTRL_V` — **fully buffered**
+### 2.3 `ZMM_301_CTRL` — control/config (FS-MM-301MOV-001) — SM30 maintenance view `ZMM_301_CTRL_V`
 
 | Field | Key | Data element / type | Description |
 |---|:---:|---|---|
@@ -139,20 +134,16 @@ Secondary index `Z01` on `AUFNR, POSNR, ERDAT, ERZET` (latest-link read).
 | MEINS | | MEINS | Unit |
 | CHARG | | CHARG_D | Batch |
 | BWTAR | | BWTAR | Destination valuation type used |
-| GJAHR | | GJAHR | Fiscal year resolved from the GR posting date |
 | RSNUM | | RSNUM | Reservation |
 | RSPOS | | RSPOS | Reservation item |
 | MOV_MBLNR | | MBLNR | Created 301 material document |
 | MOV_MJAHR | | MJAHR | Created 301 document year |
-| STATUS | | CHAR1 | S=success / E=error / R=reversed / W=warning (no reservation – posted without reference when MOV_MBLNR is filled, else skipped) |
+| STATUS | | CHAR1 | S=success / E=error / R=reversed / W=warning |
 | RUN_ID | | SYSUUID_C32 | Repost/catch-up run (FK → ZMM_301_MOV_RUN_LOG) |
 | MESSAGE | | STRING | Message |
 | ERDAT | | ERDAT | Created on |
 | ERZET | | ERZET | Created at |
 | ERNAM | | ERNAM | Created by |
-
-Secondary indexes `Z01` on `AUFNR`, `Z02` on `STATUS, ERDAT` (repost / catch-up scans).
-A row with `MOV_MBLNR` filled means the GR item is transferred (idempotency test), whatever its STATUS.
 
 ### 2.5 `ZMM_301_MOV_RUN_LOG` — monitor/repost execution log (FS-MM-301MOV-001)
 
