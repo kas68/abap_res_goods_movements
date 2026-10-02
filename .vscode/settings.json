@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 - <<'PY'\nfrom zipfile import ZipFile\nfrom xml\\.etree import ElementTree as ET\np=\"/Users/marco/Documents/GitHub/abap_res_goods_movements_report/SAP ABAP Development Standard and Namimg Conventions\\.docx\"\nwith ZipFile\\(p\\) as z:\n    data = z\\.read\\(\\[n for n in z\\.namelist\\(\\) if n\\.endswith\\('document\\.xml'\\)\\]\\[0\\]\\)\n    root=ET\\.fromstring\\(data\\)\n    ns=\\{'w':'http://schemas\\.openxmlformats\\.org/wordprocessingml/2006/main'\\}\n    paras=\\[\\]\n    for pnode in root\\.findall\\('\\.//w:p', ns\\):\n        texts=\\[\\]\n        for t in pnode\\.findall\\('\\.//w:t', ns\\):\n            if t\\.text: texts\\.append\\(t\\.text\\)\n        txt=''\\.join\\(texts\\)\\.strip\\(\\)\n        if txt: paras\\.append\\(txt\\)\n    for start,end in \\[\\(240,300\\)\\]:\n        for i in range\\(start,min\\(end,len\\(paras\\)\\)\\):\n            print\\(f'\\{i\\}: \\{paras\\[i\\]\\}'\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    },
+    "claudeCode.useTerminal": true
+}

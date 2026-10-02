@@ -1,5 +1,5 @@
 *&---------------------------------------------------------------------*
-*& Report  ZMM_R_CREATE_301_RESERV
+*& Report  ZPTP_301_RESERVATION_GENERATOR
 *&---------------------------------------------------------------------*
 *& FS-MM-301RES-001 : Create / align 301 transfer reservations for open
 *&                    production orders (origin plant -> destination plant)
@@ -9,10 +9,15 @@
 *& consume the reservation are posted by the companion object
 *& (FS-MM-301MOV-001), NOT by this program.
 *&
+*& Finished product (AFPO-MATNR, 8P01 -> 8Q01): released orders only.
+*& Optional raw materials (P_RAWMAT, 8Q01 -> 8P01): open orders (created
+*& or released). The short components of an order go into their own
+*& reservation, independent of the finished-product reservation.
+*&
 *& NOTE: BAPI field names for the reservation change/close path should be
 *&       verified against the target release (see FS Open Issue O4).
 *&---------------------------------------------------------------------*
-REPORT zmm_r_create_301_reserv.
+REPORT zptp_301_reservation_generator.
 
 TYPE-POOLS abap.
 
@@ -20,17 +25,23 @@ TYPE-POOLS abap.
 * Selection screen
 *---------------------------------------------------------------------*
 SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001. " Plants / locations
-PARAMETERS: p_werk_fr TYPE werks_d OBLIGATORY DEFAULT '8P01', " origin plant
-            p_lgor_fr TYPE lgort_d,                            " origin stor.loc
-            p_werk_to TYPE werks_d OBLIGATORY DEFAULT '8Q01', " destination plant
-            p_lgor_to TYPE lgort_d.                            " destination stor.loc
+PARAMETERS: p_werkfr TYPE werks_d OBLIGATORY DEFAULT '8P01', " origin plant
+            p_lgorfr TYPE lgort_d,                            " origin stor.loc
+            p_werkto TYPE werks_d OBLIGATORY DEFAULT '8Q01', " destination plant
+            p_lgorto TYPE lgort_d.                            " destination stor.loc
 SELECTION-SCREEN END OF BLOCK b1.
 
+" typing references for the select-options
+DATA: gv_aufnr TYPE aufnr,
+      gv_auart TYPE aufart,
+      gv_matnr TYPE matnr,
+      gv_dispo TYPE dispo.
+
 SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002. " Order selection
-SELECT-OPTIONS: so_aufnr FOR   ('AUFNR'),
-                so_auart FOR   ('AUART'),
-                so_matnr FOR   ('MATNR'),
-                so_dispo FOR   ('DISPO').
+SELECT-OPTIONS: so_aufnr FOR gv_aufnr,
+                so_auart FOR gv_auart,
+                so_matnr FOR gv_matnr,
+                so_dispo FOR gv_dispo.
 PARAMETERS:     p_rsdat  TYPE rsdat DEFAULT sy-datum OBLIGATORY. " requirement date
 SELECTION-SCREEN END OF BLOCK b2.
 
@@ -48,7 +59,7 @@ PARAMETERS: p_sched AS CHECKBOX,                               " self-reschedule
 SELECTION-SCREEN END OF BLOCK b4.
 
 SELECTION-SCREEN BEGIN OF BLOCK b5 WITH FRAME TITLE TEXT-005. " Raw materials
-PARAMETERS: p_rawmat AS CHECKBOX.                              " also reserve raw materials
+PARAMETERS: p_rawmat AS CHECKBOX USER-COMMAND raw.             " also reserve raw materials
 PARAMETERS: p_werkrf TYPE werks_d DEFAULT '8Q01'              " RM source plant (new plant)
                      MODIF ID raw,
             p_lgorrf TYPE lgort_d MODIF ID raw,               " RM source stor.loc
@@ -76,8 +87,8 @@ CONSTANTS: gc_mvt_301 TYPE bwart VALUE '301',
            gc_error     TYPE c VALUE 'E',
            gc_simulated TYPE c VALUE 'S',
            gc_skipped   TYPE c VALUE 'K',
-           " reservation kind
-           gc_kind_h    TYPE c VALUE 'H',         " header material  (8P01 -> 8Q01)
+           " reservation kind (log key)
+           gc_kind_h    TYPE c VALUE 'H',         " finished product (8P01 -> 8Q01)
            gc_kind_r    TYPE c VALUE 'R',         " raw-material comp (8Q01 -> 8P01)
            gc_freq_min  TYPE i VALUE 60,          " 1 minute floor (seconds)
            gc_freq_max  TYPE i VALUE 2592000.     " 30 days ceiling (seconds)
@@ -89,10 +100,10 @@ CLASS lcl_app DEFINITION FINAL.
 
   PUBLIC SECTION.
     TYPES: BEGIN OF ty_out,
-             res_kind     TYPE c LENGTH 1,   " H = header / R = raw material
+             res_kind     TYPE c LENGTH 1,   " H = finished product / R = raw material
              aufnr        TYPE aufnr,
              auart        TYPE aufart,
-             posnr        TYPE co_posnr,      " 0001 (header) or component RSPOS
+             posnr        TYPE co_posnr,      " 0001 (H) or component RSPOS (R)
              matnr        TYPE matnr,
              po_open      TYPE menge_d,       " basis qty: PO open (H) or shortage (R)
              res_bdmng    TYPE menge_d,
@@ -121,18 +132,19 @@ CLASS lcl_app DEFINITION FINAL.
              objnr TYPE j_objnr,
              posnr TYPE co_posnr,
              matnr TYPE matnr,
-             psmng TYPE psmng,
-             wemng TYPE wemng,
+             psmng TYPE afpo-psmng,
+             wemng TYPE afpo-wemng,
              meins TYPE meins,
              elikz TYPE elikz,
              dispo TYPE dispo,
+             rel   TYPE abap_bool,          " order released (REL)
            END OF ty_ord.
     TYPES tt_ord TYPE STANDARD TABLE OF ty_ord WITH DEFAULT KEY.
 
     DATA: mt_out    TYPE tt_out,
           mv_run_id TYPE sysuuid_c32,
           mv_mode   TYPE c LENGTH 1,    " O / B
-          ms_counts TYPE zmm_301_run_log.
+          ms_counts TYPE zptp_301_run_log.
 
     METHODS validate_selection.
     METHODS interval_in_seconds RETURNING VALUE(rv_secs) TYPE i.
@@ -142,7 +154,8 @@ CLASS lcl_app DEFINITION FINAL.
       IMPORTING is_order TYPE ty_ord.
     METHODS process_raw_components
       IMPORTING is_order TYPE ty_ord.
-    " Generic create/realign/close for one reservation item (header or RM)
+    " Create/realign/close for one reservation item (finished product or RM).
+    " CT_NEW supplied: items to create are collected by the caller instead.
     METHODS reconcile_item
       IMPORTING iv_kind     TYPE c
                 iv_aufnr    TYPE aufnr
@@ -155,10 +168,11 @@ CLASS lcl_app DEFINITION FINAL.
                 iv_werks_to TYPE werks_d
                 iv_lgor_to  TYPE lgort_d
                 iv_to_close TYPE abap_bool DEFAULT abap_false
-                iv_wemng    TYPE menge_d DEFAULT 0.
+                iv_wemng    TYPE menge_d DEFAULT 0
+      CHANGING  ct_new      TYPE tt_out OPTIONAL.
+    " One reservation with one item per row of CT_OUT
     METHODS create_reservation
-      IMPORTING is_out   TYPE ty_out
-      CHANGING  cs_out   TYPE ty_out.
+      CHANGING  ct_out   TYPE tt_out.
     METHODS change_reservation
       IMPORTING iv_close TYPE abap_bool
       CHANGING  cs_out   TYPE ty_out.
@@ -193,11 +207,13 @@ CLASS lcl_app IMPLEMENTATION.
     ms_counts-cnt_selected = lines( lt_orders ).
 
     IF lt_orders IS INITIAL.
-      MESSAGE s002(zmm301).
+      MESSAGE s028(zptp_split_val).
     ENDIF.
 
     LOOP AT lt_orders ASSIGNING FIELD-SYMBOL(<order>).
-      process_order( <order> ).                 " header material (8P01 -> 8Q01)
+      IF <order>-rel = abap_true.
+        process_order( <order> ).               " finished product (8P01 -> 8Q01)
+      ENDIF.
       IF p_rawmat = abap_true.
         process_raw_components( <order> ).      " raw materials (8Q01 -> 8P01)
       ENDIF.
@@ -228,71 +244,71 @@ CLASS lcl_app IMPLEMENTATION.
       IF is_automation_active( ) = abap_true.
         schedule_next_run( ).
       ELSE.
-        MESSAGE s012(zmm301).                       " chain stopped
+        MESSAGE s038(zptp_split_val).               " chain stopped
       ENDIF.
     ENDIF.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
   METHOD validate_selection.
-    IF p_werk_fr = p_werk_to.
-      MESSAGE e001(zmm301) WITH p_werk_fr p_werk_to.
+    IF p_werkfr = p_werkto.
+      MESSAGE e027(zptp_split_val) WITH p_werkfr p_werkto.
     ENDIF.
     " plant existence
-    SELECT SINGLE werks FROM t001w INTO @DATA(lv_w) WHERE werks = @p_werk_fr.
-    IF sy-subrc <> 0. MESSAGE e014(zmm301) WITH p_werk_fr. ENDIF.
-    SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werk_to.
-    IF sy-subrc <> 0. MESSAGE e014(zmm301) WITH p_werk_to. ENDIF.
+    SELECT SINGLE werks FROM t001w INTO @DATA(lv_w) WHERE werks = @p_werkfr.
+    IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkfr. ENDIF.
+    SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werkto.
+    IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkto. ENDIF.
     " storage location existence (only if entered)
-    IF p_lgor_fr IS NOT INITIAL.
+    IF p_lgorfr IS NOT INITIAL.
       SELECT SINGLE lgort FROM t001l INTO @DATA(lv_l)
-        WHERE werks = @p_werk_fr AND lgort = @p_lgor_fr.
-      IF sy-subrc <> 0. MESSAGE e015(zmm301) WITH p_lgor_fr p_werk_fr. ENDIF.
+        WHERE werks = @p_werkfr AND lgort = @p_lgorfr.
+      IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH p_lgorfr p_werkfr. ENDIF.
     ENDIF.
-    IF p_lgor_to IS NOT INITIAL.
+    IF p_lgorto IS NOT INITIAL.
       SELECT SINGLE lgort FROM t001l INTO @lv_l
-        WHERE werks = @p_werk_to AND lgort = @p_lgor_to.
-      IF sy-subrc <> 0. MESSAGE e015(zmm301) WITH p_lgor_to p_werk_to. ENDIF.
+        WHERE werks = @p_werkto AND lgort = @p_lgorto.
+      IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH p_lgorto p_werkto. ENDIF.
     ENDIF.
     " frequency floor / ceiling (only relevant with self-reschedule)
     IF p_sched = abap_true.
       DATA(lv_secs) = interval_in_seconds( ).
-      IF lv_secs < gc_freq_min. MESSAGE e010(zmm301). ENDIF.
-      IF lv_secs > gc_freq_max. MESSAGE e011(zmm301). ENDIF.
+      IF lv_secs < gc_freq_min. MESSAGE e036(zptp_split_val). ENDIF.
+      IF lv_secs > gc_freq_max. MESSAGE e037(zptp_split_val). ENDIF.
     ENDIF.
     " raw-material plants (only relevant when the option is active)
     IF p_rawmat = abap_true.
       IF p_werkrf IS INITIAL OR p_werkrt IS INITIAL OR p_werkrf = p_werkrt.
-        MESSAGE e016(zmm301) WITH p_werkrf p_werkrt.   " RM plants required and must differ
+        MESSAGE e042(zptp_split_val) WITH p_werkrf p_werkrt.   " RM plants required and must differ
       ENDIF.
       SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werkrf.
-      IF sy-subrc <> 0. MESSAGE e014(zmm301) WITH p_werkrf. ENDIF.
+      IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkrf. ENDIF.
       SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werkrt.
-      IF sy-subrc <> 0. MESSAGE e014(zmm301) WITH p_werkrt. ENDIF.
+      IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkrt. ENDIF.
     ENDIF.
 
     " authorization: create goods movement/reservation for the plants & mvt 301
     AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
       ID 'ACTVT' FIELD '01'
       ID 'BWART' FIELD gc_mvt_301
-      ID 'WERKS' FIELD p_werk_fr.
-    IF sy-subrc <> 0. MESSAGE e018(zmm301) WITH p_werk_fr. ENDIF.
+      ID 'WERKS' FIELD p_werkfr.
+    IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkfr. ENDIF.
     AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
       ID 'ACTVT' FIELD '01'
       ID 'BWART' FIELD gc_mvt_301
-      ID 'WERKS' FIELD p_werk_to.
-    IF sy-subrc <> 0. MESSAGE e018(zmm301) WITH p_werk_to. ENDIF.
+      ID 'WERKS' FIELD p_werkto.
+    IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkto. ENDIF.
     IF p_rawmat = abap_true.
       AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
         ID 'ACTVT' FIELD '01'
         ID 'BWART' FIELD gc_mvt_301
         ID 'WERKS' FIELD p_werkrf.
-      IF sy-subrc <> 0. MESSAGE e018(zmm301) WITH p_werkrf. ENDIF.
+      IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkrf. ENDIF.
       AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
         ID 'ACTVT' FIELD '01'
         ID 'BWART' FIELD gc_mvt_301
         ID 'WERKS' FIELD p_werkrt.
-      IF sy-subrc <> 0. MESSAGE e018(zmm301) WITH p_werkrt. ENDIF.
+      IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkrt. ENDIF.
     ENDIF.
   ENDMETHOD.
 
@@ -310,14 +326,14 @@ CLASS lcl_app IMPLEMENTATION.
   METHOD select_open_orders.
     DATA lt_ord TYPE tt_ord.
 
-    SELECT k~aufnr k~auart k~objnr
-           p~posnr p~matnr p~psmng p~wemng p~meins p~elikz
+    SELECT k~aufnr, k~auart, k~objnr,
+           p~posnr, p~matnr, p~psmng, p~wemng, p~meins, p~elikz,
            f~dispo
       FROM aufk AS k
       INNER JOIN afko AS f ON f~aufnr = k~aufnr
       INNER JOIN afpo AS p ON p~aufnr = k~aufnr
       INTO CORRESPONDING FIELDS OF TABLE @lt_ord
-      WHERE k~werks   = @p_werk_fr
+      WHERE k~werks   = @p_werkfr
         AND k~aufnr  IN @so_aufnr
         AND k~auart  IN @so_auart
         AND p~matnr  IN @so_matnr
@@ -333,7 +349,7 @@ CLASS lcl_app IMPLEMENTATION.
     lt_objnr = VALUE #( FOR l IN lt_ord ( l-objnr ) ).
     SORT lt_objnr. DELETE ADJACENT DUPLICATES FROM lt_objnr.
 
-    SELECT objnr stat FROM jest
+    SELECT objnr, stat FROM jest
       INTO TABLE @DATA(lt_jest)
       FOR ALL ENTRIES IN @lt_objnr
       WHERE objnr = @lt_objnr-table_line
@@ -341,17 +357,18 @@ CLASS lcl_app IMPLEMENTATION.
     SORT lt_jest BY objnr stat.
 
     LOOP AT lt_ord ASSIGNING FIELD-SYMBOL(<ord>).
-      DATA(lv_rel)  = xsdbool( line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_rel  ] ) ).
+      <ord>-rel     = xsdbool( line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_rel  ] ) ).
       DATA(lv_stop) = xsdbool(
              line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_teco ] )
           OR line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_clsd ] )
           OR line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_dlfl ] )
           OR line_exists( lt_jest[ objnr = <ord>-objnr stat = gc_stat_dlt  ] ) ).
 
-      " Keep released & not closed orders; a TECO/CLSD order that still has a
-      " reservation will be picked for a CLOSE action inside process_order.
-      IF lv_rel = abap_false.
-        DELETE lt_ord.  " not released -> ignore
+      " Finished products need a released order; raw materials only need an
+      " open one (created or released). A TECO/CLSD order that still has a
+      " reservation is picked for a CLOSE action by the process methods.
+      IF <ord>-rel = abap_false AND p_rawmat = abap_false.
+        DELETE lt_ord.  " not released and no RM option -> ignore
         CONTINUE.
       ENDIF.
       IF lv_stop = abap_true.
@@ -364,7 +381,7 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD process_order.
-    " Header material (8P01 -> 8Q01). Basis qty = PO open = PSMNG - WEMNG.
+    " Finished product (8P01 -> 8Q01). Basis qty = PO open = PSMNG - WEMNG.
     DATA(lv_to_close) = xsdbool( is_order-elikz = 'C' ).   " TECO/CLSD flag
     DATA(lv_po_open)  = CONV menge_d( is_order-psmng - is_order-wemng ).
 
@@ -375,18 +392,20 @@ CLASS lcl_app IMPLEMENTATION.
       iv_matnr    = is_order-matnr
       iv_basis    = lv_po_open
       iv_meins    = is_order-meins
-      iv_werks_fr = p_werk_fr
-      iv_lgor_fr  = p_lgor_fr
-      iv_werks_to = p_werk_to
-      iv_lgor_to  = p_lgor_to
+      iv_werks_fr = p_werkfr
+      iv_lgor_fr  = p_lgorfr
+      iv_werks_to = p_werkto
+      iv_lgor_to  = p_lgorto
       iv_to_close = lv_to_close
       iv_wemng    = is_order-wemng ).
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
   METHOD process_raw_components.
-    " Raw-material components (8Q01 -> 8P01). One reservation per component
-    " that is SHORT in the target (production) plant.
+    " Raw-material components (8Q01 -> 8P01) that are SHORT in the production
+    " plant. Components not yet reserved are created together in one
+    " reservation per order, separate from the finished-product reservation.
+    DATA lt_new TYPE tt_out.
     DATA(lv_to_close) = xsdbool( is_order-elikz = 'C' ).
 
     " Open component requirements of the production order.
@@ -411,26 +430,38 @@ CLASS lcl_app IMPLEMENTATION.
       DATA(lv_short) = CONV menge_d( lv_req - lv_stock ).
       IF lv_short < 0. lv_short = 0. ENDIF.
 
-      " If component now fully covered (short = 0) reconcile_item will CLOSE
-      " any existing RM reservation; if short > 0 it creates/realigns.
+      " short = 0 -> reconcile_item closes an existing RM item;
+      " short > 0 -> realigns it, or collects the component in LT_NEW.
       reconcile_item(
-        iv_kind     = gc_kind_r
-        iv_aufnr    = is_order-aufnr
-        iv_posnr    = <c>-rspos
-        iv_matnr    = <c>-matnr
-        iv_basis    = lv_short
-        iv_meins    = <c>-meins
-        iv_werks_fr = p_werkrf         " issuing = new plant (8Q01)
-        iv_lgor_fr  = p_lgorrf
-        iv_werks_to = p_werkrt         " receiving = production plant (8P01)
-        iv_lgor_to  = p_lgorrt
-        iv_to_close = COND #( WHEN lv_short <= 0 THEN abap_true ELSE lv_to_close ) ).
+        EXPORTING
+          iv_kind     = gc_kind_r
+          iv_aufnr    = is_order-aufnr
+          iv_posnr    = <c>-rspos
+          iv_matnr    = <c>-matnr
+          iv_basis    = lv_short
+          iv_meins    = <c>-meins
+          iv_werks_fr = p_werkrf         " issuing = new plant (8Q01)
+          iv_lgor_fr  = p_lgorrf
+          iv_werks_to = p_werkrt         " receiving = production plant (8P01)
+          iv_lgor_to  = p_lgorrt
+          iv_to_close = COND #( WHEN lv_short <= 0 THEN abap_true ELSE lv_to_close )
+        CHANGING
+          ct_new      = lt_new ).
     ENDLOOP.
+
+    " one RM reservation for all newly short components of this order
+    IF lt_new IS NOT INITIAL.
+      create_reservation( CHANGING ct_out = lt_new ).
+      LOOP AT lt_new ASSIGNING FIELD-SYMBOL(<n>).
+        APPEND <n> TO mt_out.
+        write_detail_log( <n> ).
+      ENDLOOP.
+    ENDIF.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
   METHOD reconcile_item.
-    " Generic create / realign / close / unchanged for one reservation item.
+    " Create / realign / close / unchanged for one reservation item.
     DATA ls_out TYPE ty_out.
     ls_out-res_kind = iv_kind.
     ls_out-aufnr    = iv_aufnr.
@@ -447,13 +478,31 @@ CLASS lcl_app IMPLEMENTATION.
     " ORDER BY needs a set read + UP TO 1 ROWS (SELECT SINGLE cannot ORDER BY).
     DATA: lv_link_rsnum TYPE rsnum,
           lv_link_rspos TYPE rspos.
-    SELECT rsnum, rspos FROM zmm_301_resv_log
+    SELECT rsnum, rspos FROM zptp_301_res_log
       WHERE aufnr = @iv_aufnr AND res_kind = @iv_kind AND posnr = @iv_posnr
         AND rsnum <> @space
       ORDER BY erdat DESCENDING, erzet DESCENDING
       INTO (@lv_link_rsnum, @lv_link_rspos)
       UP TO 1 ROWS.
     ENDSELECT.
+
+    " Fallback when the log row is missing: the order number is stored as
+    " goods recipient (RESB-WEMPF) at creation. MATNR/WERKS/XLOEK/KZEAR
+    " match RESB secondary index M.
+    IF lv_link_rsnum IS INITIAL.
+      SELECT rsnum, rspos FROM resb ##NULL_VALUES
+        WHERE matnr = @iv_matnr
+          AND werks = @iv_werks_fr
+          AND xloek = @space
+          AND kzear = @space
+          AND wempf = @iv_aufnr
+          AND umwrk = @iv_werks_to
+          AND bwart = @gc_mvt_301
+        ORDER BY rsnum DESCENDING, rspos
+        INTO (@lv_link_rsnum, @lv_link_rspos)
+        UP TO 1 ROWS.
+      ENDSELECT.
+    ENDIF.
 
     DATA lv_has_res TYPE abap_bool.
     IF lv_link_rsnum IS NOT INITIAL.
@@ -471,7 +520,7 @@ CLASS lcl_app IMPLEMENTATION.
     " reprocess-errors-only filter (latest logged status for this item)
     IF p_erron = abap_true AND lv_has_res = abap_true.
       DATA lv_last TYPE char1.
-      SELECT status FROM zmm_301_resv_log
+      SELECT status FROM zptp_301_res_log
         WHERE aufnr = @iv_aufnr AND res_kind = @iv_kind AND posnr = @iv_posnr
         ORDER BY erdat DESCENDING, erzet DESCENDING
         INTO @lv_last
@@ -496,8 +545,14 @@ CLASS lcl_app IMPLEMENTATION.
         ENDIF.
         ls_out-status = gc_skipped.
         ls_out-statxt = 'Fully received'.
+      ELSEIF ct_new IS SUPPLIED.
+        " created later by the caller, together with the other new items
+        APPEND ls_out TO ct_new.
+        RETURN.
       ELSE.
-        create_reservation( EXPORTING is_out = ls_out CHANGING cs_out = ls_out ).
+        DATA(lt_one) = VALUE tt_out( ( ls_out ) ).
+        create_reservation( CHANGING ct_out = lt_one ).
+        ls_out = lt_one[ 1 ].
       ENDIF.
     ELSE.
       IF iv_to_close = abap_true OR iv_basis <= 0.
@@ -527,35 +582,46 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD create_reservation.
-    cs_out = is_out.
+    " All rows share one direction: finished product (8P01 -> 8Q01) or
+    " raw materials (8Q01 -> 8P01); they are never mixed in one reservation.
+    FIELD-SYMBOLS <o> TYPE ty_out.
 
     IF p_test = abap_true.
-      cs_out-status = gc_simulated.
-      cs_out-statxt = 'Simulated (create)'.
+      LOOP AT ct_out ASSIGNING <o>.
+        <o>-status = gc_simulated.
+        <o>-statxt = 'Simulated (create)'.
+      ENDLOOP.
       RETURN.
     ENDIF.
 
-    DATA: ls_head   TYPE bapi2093_res_head_c1,
-          lt_items  TYPE STANDARD TABLE OF bapi2093_res_item_c1,
-          ls_item   TYPE bapi2093_res_item_c1,
+    DATA: ls_head   TYPE bapi2093_res_head,
+          lt_items  TYPE STANDARD TABLE OF bapi2093_res_item,
+          ls_item   TYPE bapi2093_res_item,
           lt_return TYPE STANDARD TABLE OF bapiret2,
-          lv_resno  TYPE rsnum.
+          lv_resno  TYPE rsnum,
+          lt_rspos  TYPE STANDARD TABLE OF rspos WITH EMPTY KEY.
 
-    ls_head-res_date = p_rsdat.
-    ls_head-movement = p_move.
+    " Movement type and receiving plant/stor.loc are header data in
+    " BAPI_RESERVATION_CREATE1 (as on the MB21 initial screen). All rows share
+    " one direction, so they are taken from the first row.
+    DATA(ls_first) = ct_out[ 1 ].
+    ls_head-res_date   = p_rsdat.
+    ls_head-move_type  = gc_mvt_301.
+    ls_head-move_plant = ls_first-werks_to.
+    ls_head-move_stloc = ls_first-lgort_to.
 
-    " Plants/locations come from the item (header: 8P01->8Q01, RM: 8Q01->8P01)
-    ls_item-material_long = is_out-matnr.
-    ls_item-material      = is_out-matnr.        " 18-char legacy field
-    ls_item-plant         = is_out-werks_fr.
-    ls_item-stge_loc      = is_out-lgort_fr.
-    ls_item-move_type     = gc_mvt_301.
-    ls_item-entry_qnt     = is_out-po_open.      " basis qty; initial ENMNG = 0
-    ls_item-entry_uom     = is_out-meins.
-    ls_item-req_date      = p_rsdat.
-    ls_item-move_plant    = is_out-werks_to.
-    ls_item-move_stloc    = is_out-lgort_to.
-    APPEND ls_item TO lt_items.
+    LOOP AT ct_out ASSIGNING <o>.
+      CLEAR ls_item.
+      ls_item-material_long = <o>-matnr.         " S/4: 40-char MATNR
+      ls_item-plant         = <o>-werks_fr.
+      ls_item-stge_loc      = <o>-lgort_fr.
+      ls_item-entry_qnt     = <o>-po_open.       " basis qty; initial ENMNG = 0
+      ls_item-entry_uom     = <o>-meins.
+      ls_item-req_date      = p_rsdat.
+      ls_item-movement      = p_move.            " movement allowed (RESB-XWAOK)
+      ls_item-gr_rcpt       = <o>-aufnr.         " order no. -> RESB-WEMPF (2nd link)
+      APPEND ls_item TO lt_items.
+    ENDLOOP.
 
     CALL FUNCTION 'BAPI_RESERVATION_CREATE1'
       EXPORTING
@@ -576,16 +642,26 @@ CLASS lcl_app IMPLEMENTATION.
 
     IF lv_err = abap_true.
       CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
-      cs_out-status  = gc_error.
-      cs_out-statxt  = 'Create error'.
-      cs_out-message = VALUE #( lt_return[ type = 'E' ]-message OPTIONAL ).
+      DATA(lv_msg) = VALUE string( lt_return[ type = 'E' ]-message OPTIONAL ).
+      LOOP AT ct_out ASSIGNING <o>.
+        <o>-status  = gc_error.
+        <o>-statxt  = 'Create error'.
+        <o>-message = lv_msg.
+      ENDLOOP.
     ELSE.
       CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
-      cs_out-rsnum   = lv_resno.
-      cs_out-rspos   = '0001'.
-      cs_out-status  = gc_created.
-      cs_out-statxt  = 'Created'.
-      cs_out-message = |Reservation { lv_resno } created|.
+      " item numbers are assigned in the sequence of LT_ITEMS
+      SELECT rspos FROM resb INTO TABLE @lt_rspos
+        WHERE rsnum = @lv_resno
+        ORDER BY rspos.
+      LOOP AT ct_out ASSIGNING <o>.
+        DATA(lv_idx) = sy-tabix.
+        <o>-rsnum   = lv_resno.
+        <o>-rspos   = VALUE #( lt_rspos[ lv_idx ] DEFAULT lv_idx ).
+        <o>-status  = gc_created.
+        <o>-statxt  = 'Created'.
+        <o>-message = |Reservation { lv_resno } created|.
+      ENDLOOP.
     ENDIF.
   ENDMETHOD.
 
@@ -605,33 +681,29 @@ CLASS lcl_app IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    DATA: lt_items  TYPE STANDARD TABLE OF bapi2093_res_item_c,
-          lt_itemsx TYPE STANDARD TABLE OF bapi2093_res_item_cx,
+    DATA: lt_items  TYPE STANDARD TABLE OF bapi2093_res_item_change,
+          lt_itemsx TYPE STANDARD TABLE OF bapi2093_res_item_changex,
           lt_return TYPE STANDARD TABLE OF bapiret2,
-          ls_i      TYPE bapi2093_res_item_c,
-          ls_ix     TYPE bapi2093_res_item_cx.
+          ls_i      TYPE bapi2093_res_item_change,
+          ls_ix     TYPE bapi2093_res_item_changex.
 
-    " The reservation requirement quantity (RESB-BDMNG) is carried in REQ_QUAN
-    " in these BAPI structures; ENTRY_QNT is the entry-UoM quantity. Set both
-    " and flag both in the X-structure so the requirement actually changes.
-    " *** verify REQ_QUAN/ENTRY_QNT field names for the target release (O4) ***
+    " Items are created in base UoM (ENTRY_UOM = MEINS), so changing ENTRY_QNT
+    " sets the requirement quantity RESB-BDMNG.
     ls_i-res_item  = cs_out-rspos.
-    ls_i-req_quan  = lv_newqty.
     ls_i-entry_qnt = lv_newqty.
     APPEND ls_i TO lt_items.
 
     ls_ix-res_item  = cs_out-rspos.
-    ls_ix-req_quan  = 'X'.
     ls_ix-entry_qnt = 'X'.
     APPEND ls_ix TO lt_itemsx.
 
     CALL FUNCTION 'BAPI_RESERVATION_CHANGE'
       EXPORTING
-        reservation       = cs_out-rsnum
+        reservation               = cs_out-rsnum
       TABLES
-        reservationitems  = lt_items
-        reservationitemsx = lt_itemsx
-        return            = lt_return.
+        reservationitems_changed  = lt_items
+        reservationitems_changedx = lt_itemsx
+        return                    = lt_return.
 
     READ TABLE lt_return TRANSPORTING NO FIELDS WITH KEY type = 'E'.
     IF sy-subrc = 0.
@@ -658,8 +730,8 @@ CLASS lcl_app IMPLEMENTATION.
     ms_counts = VALUE #( run_id     = mv_run_id
                          run_mode   = mv_mode
                          jobname    = COND #( WHEN mv_mode = 'B' THEN sy-msgv1 )
-                         werks_fr   = p_werk_fr
-                         werks_to   = p_werk_to
+                         werks_fr   = p_werkfr
+                         werks_to   = p_werkto
                          test_run   = p_test
                          self_sched = p_sched
                          freq_value = p_freq
@@ -668,8 +740,8 @@ CLASS lcl_app IMPLEMENTATION.
                          start_time = sy-uzeit
                          status     = 'R'
                          ernam      = sy-uname
-                         sel_text   = |FR { p_werk_fr } TO { p_werk_to } DATE { p_rsdat }| ).
-    MODIFY zmm_301_run_log FROM @ms_counts.
+                         sel_text   = |FR { p_werkfr } TO { p_werkto } DATE { p_rsdat }| ).
+    MODIFY zptp_301_run_log FROM @ms_counts.
     COMMIT WORK.
   ENDMETHOD.
 
@@ -685,13 +757,13 @@ CLASS lcl_app IMPLEMENTATION.
     CONVERT DATE ms_counts-end_date TIME ms_counts-end_time
             INTO TIME STAMP lv_ts2 TIME ZONE sy-zonlo.
     ms_counts-duration_s = cl_abap_tstmp=>subtract( tstmp1 = lv_ts2 tstmp2 = lv_ts1 ).
-    MODIFY zmm_301_run_log FROM @ms_counts.
+    MODIFY zptp_301_run_log FROM @ms_counts.
     COMMIT WORK.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
   METHOD write_detail_log.
-    DATA ls_log TYPE zmm_301_resv_log.
+    DATA ls_log TYPE zptp_301_res_log.
     ls_log = VALUE #( aufnr     = is_out-aufnr
                       res_kind  = is_out-res_kind
                       posnr     = is_out-posnr
@@ -710,7 +782,7 @@ CLASS lcl_app IMPLEMENTATION.
                       erdat     = sy-datum
                       erzet     = sy-uzeit
                       ernam     = sy-uname ).
-    MODIFY zmm_301_resv_log FROM @ls_log.
+    MODIFY zptp_301_res_log FROM @ls_log.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -730,8 +802,8 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD is_automation_active.
-    SELECT SINGLE active FROM zmm_301_ctrl INTO @DATA(lv_a)
-      WHERE werks_fr = @p_werk_fr AND werks_to = @p_werk_to.
+    SELECT SINGLE active FROM zptp_301_ctrl INTO @DATA(lv_a)
+      WHERE werks_fr = @p_werkfr AND werks_to = @p_werkto.
     rv_active = xsdbool( sy-subrc = 0 AND lv_a = abap_true ).
   ENDMETHOD.
 
@@ -741,10 +813,10 @@ CLASS lcl_app IMPLEMENTATION.
     DATA: lv_date TYPE d, lv_time TYPE t, lv_ts TYPE timestamp.
     lv_date = sy-datum. lv_time = sy-uzeit.
     CONVERT DATE lv_date TIME lv_time INTO TIME STAMP lv_ts TIME ZONE sy-zonlo.
-    lv_ts = cl_abap_tstmp=>add( tstmp = lv_ts secs = interval_in_seconds( ) ).
+    lv_ts = cl_abap_tstmp=>add_to_short( tstmp = lv_ts secs = interval_in_seconds( ) ).
     CONVERT TIME STAMP lv_ts TIME ZONE sy-zonlo INTO DATE lv_date TIME lv_time.
 
-    DATA: lv_jobname  TYPE btcjob VALUE 'ZMM301R_CHAIN',
+    DATA: lv_jobname  TYPE btcjob VALUE 'ZPTP_301_RES_CHAIN',
           lv_jobcount TYPE btcjobcnt.
 
     CALL FUNCTION 'JOB_OPEN'
@@ -753,11 +825,11 @@ CLASS lcl_app IMPLEMENTATION.
       EXCEPTIONS OTHERS = 1.
     IF sy-subrc <> 0. RETURN. ENDIF.
 
-    SUBMIT zmm_r_create_301_reserv
-      WITH p_werk_fr = p_werk_fr
-      WITH p_lgor_fr = p_lgor_fr
-      WITH p_werk_to = p_werk_to
-      WITH p_lgor_to = p_lgor_to
+    SUBMIT zptp_301_reservation_generator
+      WITH p_werkfr = p_werkfr
+      WITH p_lgorfr = p_lgorfr
+      WITH p_werkto = p_werkto
+      WITH p_lgorto = p_lgorto
       WITH p_rsdat   = p_rsdat
       WITH p_move    = p_move
       WITH p_test    = p_test
@@ -765,6 +837,11 @@ CLASS lcl_app IMPLEMENTATION.
       WITH p_sched   = p_sched
       WITH p_freq    = p_freq
       WITH p_funit   = p_funit
+      WITH p_rawmat  = p_rawmat
+      WITH p_werkrf  = p_werkrf
+      WITH p_lgorrf  = p_lgorrf
+      WITH p_werkrt  = p_werkrt
+      WITH p_lgorrt  = p_lgorrt
       VIA JOB lv_jobname NUMBER lv_jobcount
       AND RETURN.
 
@@ -778,20 +855,25 @@ CLASS lcl_app IMPLEMENTATION.
     " record next run in the execution log
     ms_counts-next_run_dt = lv_date.
     ms_counts-next_run_tm = lv_time.
-    MODIFY zmm_301_run_log FROM @ms_counts.
+    MODIFY zptp_301_run_log FROM @ms_counts.
     COMMIT WORK.
-    MESSAGE s013(zmm301) WITH lv_date lv_time.
+    MESSAGE s039(zptp_split_val) WITH lv_date lv_time.
   ENDMETHOD.
 
 ENDCLASS.
 
 *---------------------------------------------------------------------*
-INITIALIZATION.
-  " listbox values for frequency unit (P_FUNIT) and any texts
-  " (populate via VRM_SET_VALUES in a real build; omitted for brevity)
-
-*---------------------------------------------------------------------*
 AT SELECTION-SCREEN OUTPUT.
+  " listbox values for the frequency unit
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'P_FUNIT'
+      values = VALUE vrm_values( ( key = 'MIN' text = TEXT-l01 )
+                                 ( key = 'HRS' text = TEXT-l02 )
+                                 ( key = 'DAY' text = TEXT-l03 ) )
+    EXCEPTIONS
+      OTHERS = 1.
+
   " enable the raw-material plant/loc fields only when P_RAWMAT is ticked
   LOOP AT SCREEN.
     IF screen-group1 = 'RAW'.

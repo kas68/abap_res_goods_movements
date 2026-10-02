@@ -1,10 +1,10 @@
 *&---------------------------------------------------------------------*
-*& Function module  Z_MM_301_POST_TRANSFER
+*& Function module  Z_PTP_301_TRANSFER_POST
 *&---------------------------------------------------------------------*
 *& FS-MM-301MOV-001 : Post (or reverse) the 301 transfer for one goods
 *& receipt item, in its own LUW. Called IN BACKGROUND TASK from the
-*& MB_DOCUMENT_BADI implementation (ZCL_MM_301_GR_TRIGGER), and also by the
-*& monitor/repost report (ZMM_R_301_MOV_MONITOR).
+*& MB_DOCUMENT_BADI implementation (ZCL_IM_MB_DOC_301_TRANSFER), and also by the
+*& monitor/repost report (ZPTP_301_MOVEMENT_MONITOR).
 *&
 *& Processing type : Remote-Enabled Module (required for IN BACKGROUND TASK)
 *&
@@ -12,31 +12,31 @@
 *&   IV_MBLNR    TYPE mblnr     Source GR material document
 *&   IV_MJAHR    TYPE mjahr     Source GR document year
 *&   IV_ZEILE    TYPE mblpo     Source GR item
-*&   IV_REVERSAL TYPE abap_bool 'X' = GR was reversed (cancel the 301)
+*&   IV_REVERSAL TYPE abap_boolean 'X' = GR was reversed (cancel the 301)
 *&   IV_RUN_ID   TYPE sysuuid_c32  (optional) repost/catch-up run id
-*&   IV_COMMIT   TYPE abap_bool  'X' = synchronous caller (monitor) -> this FM
+*&   IV_COMMIT   TYPE abap_boolean 'X' = synchronous caller (monitor) -> this FM
 *&                 commits itself. SPACE = called IN BACKGROUND TASK (tRFC):
 *&                 the tRFC framework owns COMMIT WORK, so this FM must NOT
 *&                 issue COMMIT WORK / ROLLBACK WORK itself.
 *&---------------------------------------------------------------------*
-FUNCTION z_mm_301_post_transfer.
+FUNCTION z_ptp_301_transfer_post.
 *"----------------------------------------------------------------------
 *"*"Local Interface:
 *"  IMPORTING
 *"     VALUE(IV_MBLNR) TYPE MBLNR
 *"     VALUE(IV_MJAHR) TYPE MJAHR
 *"     VALUE(IV_ZEILE) TYPE MBLPO
-*"     VALUE(IV_REVERSAL) TYPE ABAP_BOOL DEFAULT SPACE
+*"     VALUE(IV_REVERSAL) TYPE ABAP_BOOLEAN DEFAULT SPACE
 *"     VALUE(IV_RUN_ID) TYPE SYSUUID_C32 OPTIONAL
-*"     VALUE(IV_COMMIT) TYPE ABAP_BOOL DEFAULT SPACE
+*"     VALUE(IV_COMMIT) TYPE ABAP_BOOLEAN DEFAULT SPACE
 *"----------------------------------------------------------------------
 
-  DATA: ls_log TYPE zmm_301_mov_log.
+  DATA: ls_log TYPE zptp_301_mov_log.
 
   " Persist the movement log. In the tRFC path (IV_COMMIT = space) the
   " framework issues COMMIT WORK, so we never COMMIT/ROLLBACK here.
   DEFINE _persist_log.
-    MODIFY zmm_301_mov_log FROM @ls_log.
+    MODIFY zptp_301_mov_log FROM @ls_log.
     IF iv_commit = abap_true.
       COMMIT WORK.
     ENDIF.
@@ -45,7 +45,7 @@ FUNCTION z_mm_301_post_transfer.
 *--------------------------------------------------------------------*
 * 1) Idempotency – skip if this source item was already transferred OK
 *--------------------------------------------------------------------*
-  SELECT SINGLE * FROM zmm_301_mov_log INTO @DATA(ls_prev)
+  SELECT SINGLE * FROM zptp_301_mov_log INTO @DATA(ls_prev)
     WHERE src_mblnr = @iv_mblnr
       AND src_mjahr = @iv_mjahr
       AND src_zeile = @iv_zeile.
@@ -77,7 +77,7 @@ FUNCTION z_mm_301_post_transfer.
 *--------------------------------------------------------------------*
 * 3) Control entry for the origin plant
 *--------------------------------------------------------------------*
-  SELECT SINGLE * FROM zmm_301_ctrl INTO @DATA(ls_ctrl)
+  SELECT SINGLE * FROM zptp_301_ctrl INTO @DATA(ls_ctrl)
     WHERE werks_fr = @ls_seg-werks AND active = @abap_true.
   IF sy-subrc <> 0.
     RETURN.                              " automation inactive for this plant
@@ -104,7 +104,7 @@ FUNCTION z_mm_301_post_transfer.
 *--------------------------------------------------------------------*
   IF iv_reversal = abap_true.
     " the 102 line references the original GR via SMBLN / SMBLP / SJAHR
-    SELECT SINGLE mov_mblnr, mov_mjahr FROM zmm_301_mov_log
+    SELECT SINGLE mov_mblnr, mov_mjahr FROM zptp_301_mov_log
       INTO @DATA(ls_orig)
       WHERE src_mblnr = @ls_seg-smbln
         AND src_mjahr = @ls_seg-sjahr
@@ -131,7 +131,7 @@ FUNCTION z_mm_301_post_transfer.
         CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
       ENDIF.
       ls_log-status  = 'E'.
-      ls_log-message = VALUE #( lt_ret_c[ type = 'E' ]-message OPTIONAL DEFAULT 'Cancel error' ).
+      ls_log-message = VALUE #( lt_ret_c[ type = 'E' ]-message DEFAULT `Cancel error` ).
     ELSE.
       IF iv_commit = abap_true.
         CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
@@ -146,16 +146,32 @@ FUNCTION z_mm_301_post_transfer.
 *--------------------------------------------------------------------*
 * 5) Reservation for the order (link table + open check)
 *--------------------------------------------------------------------*
-  " IMPORTANT: only the HEADER reservation (RES_KIND = 'H', 8P01->8Q01) is
-  " relevant here; raw-material rows ('R', 8Q01->8P01) must be excluded.
+  " Finished-product reservation (RES_KIND = 'H', 8P01->8Q01).
   DATA: lv_link_rsnum TYPE rsnum,
         lv_link_rspos TYPE rspos.
-  SELECT rsnum, rspos FROM zmm_301_resv_log
+  SELECT rsnum, rspos FROM zptp_301_res_log
     WHERE aufnr = @ls_seg-aufnr AND res_kind = 'H' AND rsnum <> @space
     ORDER BY erdat DESCENDING, erzet DESCENDING
     INTO (@lv_link_rsnum, @lv_link_rspos)
     UP TO 1 ROWS.
   ENDSELECT.
+
+  " Fallback when the log row is missing: the reservation generator stores
+  " the order number as goods recipient (RESB-WEMPF).
+  IF lv_link_rsnum IS INITIAL.
+    SELECT rsnum, rspos FROM resb ##NULL_VALUES
+      WHERE matnr = @ls_seg-matnr
+        AND werks = @ls_seg-werks
+        AND xloek = @space
+        AND kzear = @space
+        AND wempf = @ls_seg-aufnr
+        AND umwrk = @ls_ctrl-werks_to
+        AND bwart = @lv_movetype
+      ORDER BY rsnum DESCENDING, rspos
+      INTO (@lv_link_rsnum, @lv_link_rspos)
+      UP TO 1 ROWS.
+    ENDSELECT.
+  ENDIF.
 
   DATA lv_resno TYPE rsnum.
   DATA lv_respo TYPE rspos.
@@ -201,8 +217,8 @@ FUNCTION z_mm_301_post_transfer.
   ENDIF.
 
   " company-specific entry wins over the global (blank BUKRS) one
-  DATA lv_valtype TYPE bwtar.
-  SELECT bwtar FROM zmm_301_valtype
+  DATA lv_valtype TYPE bwtar_d.
+  SELECT bwtar FROM zptp_301_valtype
     WHERE ( bukrs = @lv_bukrs OR bukrs = @space )
       AND gjahr  = @lv_gjahr
       AND active = @abap_true
@@ -224,7 +240,7 @@ FUNCTION z_mm_301_post_transfer.
 * 7) Post the 301 transfer via BAPI_GOODS_MOVEMENT_CREATE
 *--------------------------------------------------------------------*
   DATA: ls_head TYPE bapi2017_gm_head_01,
-        lv_code TYPE bapi2017_gm_code VALUE '04',   " 04 = transfer posting (MB1B)
+        ls_code TYPE bapi2017_gm_code,
         ls_item TYPE bapi2017_gm_item_create,
         lt_item TYPE STANDARD TABLE OF bapi2017_gm_item_create,
         lt_ret  TYPE STANDARD TABLE OF bapiret2,
@@ -235,9 +251,9 @@ FUNCTION z_mm_301_post_transfer.
   ls_head-doc_date   = ls_kpf-bldat.
   ls_head-ref_doc_no = iv_mblnr.
   ls_head-header_txt = |AUTO301 GR { iv_mblnr }|.
+  ls_code-gm_code    = '04'.                        " 04 = transfer posting (MB1B)
 
-  ls_item-material_long = ls_seg-matnr.
-  ls_item-material      = ls_seg-matnr.
+  ls_item-material_long = ls_seg-matnr.                " S/4: 40-char MATNR
   ls_item-plant         = ls_ctrl-werks_fr.
   ls_item-stge_loc      = COND #( WHEN ls_seg-lgort IS NOT INITIAL
                                   THEN ls_seg-lgort ELSE ls_ctrl-lgort_fr ).
@@ -251,7 +267,7 @@ FUNCTION z_mm_301_post_transfer.
   ls_item-move_batch    = ls_seg-charg.
   " valuation types: origin blank (not split-valuated); destination = current FY
   CLEAR ls_item-val_type.
-  ls_item-val_type_move = lv_valtype.                " *** verify field name in target release ***
+  ls_item-move_val_type = lv_valtype.
   " reservation reference (consumes ENMNG)
   IF lv_resno IS NOT INITIAL.
     ls_item-reserv_no = lv_resno.
@@ -263,7 +279,7 @@ FUNCTION z_mm_301_post_transfer.
   CALL FUNCTION 'BAPI_GOODS_MOVEMENT_CREATE'
     EXPORTING
       goodsmvt_header  = ls_head
-      goodsmvt_code    = lv_code
+      goodsmvt_code    = ls_code
     IMPORTING
       materialdocument = lv_matdoc
       matdocumentyear  = lv_matyr
@@ -278,7 +294,7 @@ FUNCTION z_mm_301_post_transfer.
       CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
     ENDIF.
     ls_log-status  = 'E'.
-    ls_log-message = VALUE #( lt_ret[ type = 'E' ]-message OPTIONAL DEFAULT 'Posting error' ).
+    ls_log-message = VALUE #( lt_ret[ type = 'E' ]-message DEFAULT `Posting error` ).
   ELSE.
     IF iv_commit = abap_true.
       CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.

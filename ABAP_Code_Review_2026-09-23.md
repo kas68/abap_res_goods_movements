@@ -1,7 +1,7 @@
 # ABAP Code Review – 301 Migration Transfer (R-xxx-SEG / E-xxx-SEG)
 
 **Scope:** 4 files in `abap_res_goods_movements/` (≈1,750 lines)
-`ZCL_MM_301_GR_TRIGGER` · `Z_MM_301_POST_TRANSFER` · `ZMM_R_301_MOV_MONITOR` · `ZMM_R_CREATE_301_RESERV`
+`ZCL_IM_MM_301_GR_TRIGGER` · `Z_MM_301_POST_TRANSFER` · `ZMM_301_MOVEMENT_MONITOR` · `ZMM_301_RESERVATION_GENERATOR`
 **Reviewed against:** README, `00_DDIC_and_message_class.md` (v0.3, 22-Sep-2026)
 **Date:** 23-Sep-2026. This is a static review; nothing was activated in a system.
 
@@ -34,13 +34,13 @@ Several problems must be fixed before unit test:
 | B1 | `Z_MM_301_POST_TRANSFER` L281 (and comment L243) | `CALL FUNCTION 'BAPI_GOODS_MOVEMENT_CREATE'` does not exist. It will raise the runtime error `CALL_FUNCTION_NOT_FOUND` on the first GR. | Use `'BAPI_GOODSMVT_CREATE'`. The parameter names already match it. |
 | B2 | `Z_MM_301_POST_TRANSFER` L295 | `VALUE #( lt_ret[ type = 'E' ]-message OPTIONAL DEFAULT 'Posting error' )`: `OPTIONAL` and `DEFAULT` are mutually exclusive, so this is a syntax error. | `VALUE #( lt_ret[ type = 'E' ]-message DEFAULT VALUE #( lt_ret[ type = 'A' ]-message DEFAULT 'Posting error' ) )`. Apply the same pattern at L151, which currently returns blank when only an 'A' message exists. |
 | B3 | `Z_MM_301_POST_TRANSFER` L272 | `ls_item-val_type_move`: the receiving valuation-type field in `BAPI2017_GM_ITEM_CREATE` is **`MOVE_VAL_TYPE`** (UMBAR), which closes README point 1 / FS M9. | Rename it to `ls_item-move_val_type`. |
-| B4 | `ZMM_R_CREATE_301_RESERV` L505-516, L581-601 | **Probable structure mismatch; confirm in SE11.** In `BAPI_RESERVATION_CREATE1`, `MOVE_TYPE`, `MOVE_PLANT` and `MOVE_STLOC` are **header** fields (`BAPI2093_RES_HEAD`, one movement type per reservation, as in MB21). The "movement allowed" flag `MOVEMENT` is an **item** field. The code does it the other way round. Likewise, `BAPI_RESERVATION_CHANGE` normally uses the tables `RESERVATIONITEMS_CHANGED` / `RESERVATIONITEMS_CHANGEDX` (`BAPI2093_RES_ITEM_CHANGE` / `…X`), not `RESERVATIONITEMS` / `…X` with `_C` / `_CX` types. | Align with SE37 / SE11 before activating. This closes README points 2 and 3 / FS O4. |
+| B4 | `ZMM_301_RESERVATION_GENERATOR` L505-516, L581-601 | **Probable structure mismatch; confirm in SE11.** In `BAPI_RESERVATION_CREATE1`, `MOVE_TYPE`, `MOVE_PLANT` and `MOVE_STLOC` are **header** fields (`BAPI2093_RES_HEAD`, one movement type per reservation, as in MB21). The "movement allowed" flag `MOVEMENT` is an **item** field. The code does it the other way round. Likewise, `BAPI_RESERVATION_CHANGE` normally uses the tables `RESERVATIONITEMS_CHANGED` / `RESERVATIONITEMS_CHANGEDX` (`BAPI2093_RES_ITEM_CHANGE` / `…X`), not `RESERVATIONITEMS` / `…X` with `_C` / `_CX` types. | Align with SE37 / SE11 before activating. This closes README points 2 and 3 / FS O4. |
 
 ---
 
 ## 3. High – functional / data integrity
 
-**H1 – Reposting a failed reversal posts a second 301.** (`ZMM_R_301_MOV_MONITOR` L190, `Z_MM_301_POST_TRANSFER`)
+**H1 – Reposting a failed reversal posts a second 301.** (`ZMM_301_MOVEMENT_MONITOR` L190, `Z_MM_301_POST_TRANSFER`)
 Mode P always calls the FM with `iv_reversal = abap_false`. If a 102 row is in status E (for example because the 302 failed on a lock), the repost goes down the forward path, and the FM never checks `MSEG-BWART`. The result is another 301 instead of a 302.
 → The FM should derive the direction from the source line: `iv_reversal = xsdbool( ls_seg-bwart = '102' )`. Treat the parameter as a hint at most.
 
@@ -48,13 +48,13 @@ Mode P always calls the FM with `iv_reversal = abap_false`. If a 102 row is in s
 `BAPI_GOODSMVT_CANCEL` reverses the complete 301 document. A 102 for part of the GR quantity therefore moves back the full quantity.
 → If `ls_seg-menge` < the original 301 quantity, post a **302 via `BAPI_GOODSMVT_CREATE`** for the 102 quantity instead of cancelling. Also pass `goodsmvt_pstng_date` = the 102 posting date, and store the 302 document number (see M3).
 
-**H3 – The catch-up scan re-transfers GRs that were already reversed.** (`ZMM_R_301_MOV_MONITOR` `select_catchup`)
+**H3 – The catch-up scan re-transfers GRs that were already reversed.** (`ZMM_301_MOVEMENT_MONITOR` `select_catchup`)
 The scan selects every 101 with no transfer log, including 101s that a 102 has since cancelled. It also never looks for 102s that are missing a 302.
 → Exclude 101 lines referenced by a 102 (`MSEG-SMBLN / SJAHR / SMBLP`), and add a second scan for 102s whose original has an open 301.
 
-**H4 – The catch-up filter differs from the BAdI filter.** (`select_catchup` vs `ZCL_MM_301_GR_TRIGGER`)
+**H4 – The catch-up filter differs from the BAdI filter.** (`select_catchup` vs `ZCL_IM_MM_301_GR_TRIGGER`)
 The catch-up does not check the header material, the validity window or `KZBEW`. It will post 301s that the BAdI would have skipped, such as co-products or GRs outside the activation window.
-→ Put the eligibility rules in one reusable method, for example a static `ZCL_MM_301_GR_TRIGGER=>is_eligible( )`, and have the BAdI, the catch-up and the FM all call it.
+→ Put the eligibility rules in one reusable method, for example a static `ZCL_IM_MM_301_GR_TRIGGER=>is_eligible( )`, and have the BAdI, the catch-up and the FM all call it.
 
 **H5 – No lock between the tRFC, the monitor repost and the catch-up, so the same GR item can be posted twice.**
 The idempotency check (FM L39) is a plain read. A catch-up run can pick up a GR whose tRFC unit has not yet executed, and both then post.

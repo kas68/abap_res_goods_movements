@@ -1,12 +1,12 @@
 *&---------------------------------------------------------------------*
-*& Report  ZMM_R_301_MOV_MONITOR   (txn ZMM301M)
+*& Report  ZPTP_301_MOVEMENT_MONITOR   (txn ZPTP_301_MON)
 *&---------------------------------------------------------------------*
 *& FS-MM-301MOV-001 : Monitor & repost/catch-up utility for the
 *& GR-triggered 301 transfers.
 *&
-*&  Mode M (Monitor) : display ZMM_301_MOV_LOG (ALV)
+*&  Mode M (Monitor) : display ZPTP_301_MOV_LOG (ALV)
 *&  Mode P (Repost)  : re-post failed / warning entries via
-*&                     Z_MM_301_POST_TRANSFER (idempotent)
+*&                     Z_PTP_301_TRANSFER_POST (idempotent)
 *&  Mode C (Catch-up): scan MSEG for 101 GRs in the window against orders
 *&                     in the origin plant that have NO successful transfer,
 *&                     and post the missing 301s
@@ -14,12 +14,15 @@
 *& The catch-up frequency is parameter-driven (1 min .. days) and uses the
 *& same self-rescheduling pattern as FS-MM-301RES-001 §6.9.
 *&---------------------------------------------------------------------*
-REPORT zmm_r_301_mov_monitor.
+REPORT zptp_301_movement_monitor.
+
+" typing reference for the select-option
+DATA gv_aufnr TYPE aufnr.
 
 SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
-PARAMETERS: p_werk_fr TYPE werks_d OBLIGATORY DEFAULT '8P01'.
+PARAMETERS: p_werkfr TYPE werks_d OBLIGATORY DEFAULT '8P01'.
 SELECT-OPTIONS: so_budat FOR sy-datum,
-                so_aufnr FOR ('AUFNR').
+                so_aufnr FOR gv_aufnr.
 SELECTION-SCREEN END OF BLOCK b1.
 
 SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.
@@ -41,8 +44,8 @@ CLASS lcl_mon DEFINITION FINAL.
   PUBLIC SECTION.
     METHODS run.
   PRIVATE SECTION.
-    DATA: ms_run  TYPE zmm_301_mov_run_log,
-          mt_disp TYPE STANDARD TABLE OF zmm_301_mov_log.
+    DATA: ms_run  TYPE zptp_301_movrlog,
+          mt_disp TYPE STANDARD TABLE OF zptp_301_mov_log.
     METHODS start_log IMPORTING iv_type TYPE c.
     METHODS finish_log IMPORTING iv_status TYPE c.
     METHODS monitor.
@@ -60,7 +63,7 @@ CLASS lcl_mon IMPLEMENTATION.
     IF p_sched = abap_true.
       DATA(lv_s) = interval_secs( ).
       IF lv_s < gc_freq_min OR lv_s > gc_freq_max.
-        MESSAGE e010(zmm301).
+        MESSAGE e036(zptp_split_val).
       ENDIF.
     ENDIF.
 
@@ -78,19 +81,19 @@ CLASS lcl_mon IMPLEMENTATION.
 
     IF p_sched = abap_true AND p_mode = 'C'.
       " only the catch-up mode self-reschedules
-      SELECT SINGLE active FROM zmm_301_ctrl INTO @DATA(lv_a)
-        WHERE werks_fr = @p_werk_fr AND active = @abap_true.
+      SELECT SINGLE active FROM zptp_301_ctrl INTO @DATA(lv_a)
+        WHERE werks_fr = @p_werkfr AND active = @abap_true.
       IF sy-subrc = 0.
         schedule_next( ).
       ELSE.
-        MESSAGE s012(zmm301).
+        MESSAGE s038(zptp_split_val).
       ENDIF.
     ENDIF.
   ENDMETHOD.
 
 *-------------------------------------------------------------*
   METHOD monitor.
-    SELECT * FROM zmm_301_mov_log INTO TABLE @mt_disp
+    SELECT * FROM zptp_301_mov_log INTO TABLE @mt_disp
       WHERE erdat IN @so_budat
         AND aufnr IN @so_aufnr.
     ms_run-cnt_scanned = lines( mt_disp ).
@@ -106,14 +109,14 @@ CLASS lcl_mon IMPLEMENTATION.
 
 *-------------------------------------------------------------*
   METHOD repost_errors.
-    SELECT * FROM zmm_301_mov_log INTO TABLE @DATA(lt_err)
+    SELECT * FROM zptp_301_mov_log INTO TABLE @DATA(lt_err)
       WHERE erdat IN @so_budat
         AND aufnr IN @so_aufnr
         AND status IN ( 'E', 'W' ).
     ms_run-cnt_scanned = lines( lt_err ).
 
     LOOP AT lt_err ASSIGNING FIELD-SYMBOL(<e>).
-      CALL FUNCTION 'Z_MM_301_POST_TRANSFER'
+      CALL FUNCTION 'Z_PTP_301_TRANSFER_POST'
         EXPORTING
           iv_mblnr    = <e>-src_mblnr
           iv_mjahr    = <e>-src_mjahr
@@ -122,7 +125,7 @@ CLASS lcl_mon IMPLEMENTATION.
           iv_run_id   = ms_run-run_id
           iv_commit   = abap_true.        " synchronous call -> FM commits
       " re-read outcome
-      SELECT SINGLE status FROM zmm_301_mov_log INTO @DATA(lv_st)
+      SELECT SINGLE status FROM zptp_301_mov_log INTO @DATA(lv_st)
         WHERE src_mblnr = @<e>-src_mblnr
           AND src_mjahr = @<e>-src_mjahr
           AND src_zeile = @<e>-src_zeile.
@@ -142,7 +145,7 @@ CLASS lcl_mon IMPLEMENTATION.
       INNER JOIN mkpf AS h ON h~mblnr = s~mblnr AND h~mjahr = s~mjahr
       INTO TABLE @DATA(lt_gr)
       WHERE s~bwart = '101'
-        AND s~werks = @p_werk_fr
+        AND s~werks = @p_werkfr
         AND s~aufnr <> @space
         AND s~aufnr IN @so_aufnr
         AND h~budat IN @so_budat.
@@ -150,7 +153,7 @@ CLASS lcl_mon IMPLEMENTATION.
 
     LOOP AT lt_gr ASSIGNING FIELD-SYMBOL(<g>).
       " skip if a successful transfer already exists
-      SELECT SINGLE status FROM zmm_301_mov_log INTO @DATA(lv_st)
+      SELECT SINGLE status FROM zptp_301_mov_log INTO @DATA(lv_st)
         WHERE src_mblnr = @<g>-mblnr
           AND src_mjahr = @<g>-mjahr
           AND src_zeile = @<g>-zeile.
@@ -159,7 +162,7 @@ CLASS lcl_mon IMPLEMENTATION.
         CONTINUE.
       ENDIF.
 
-      CALL FUNCTION 'Z_MM_301_POST_TRANSFER'
+      CALL FUNCTION 'Z_PTP_301_TRANSFER_POST'
         EXPORTING
           iv_mblnr    = <g>-mblnr
           iv_mjahr    = <g>-mjahr
@@ -168,7 +171,7 @@ CLASS lcl_mon IMPLEMENTATION.
           iv_run_id   = ms_run-run_id
           iv_commit   = abap_true.        " synchronous call -> FM commits
 
-      SELECT SINGLE status FROM zmm_301_mov_log INTO @lv_st
+      SELECT SINGLE status FROM zptp_301_mov_log INTO @lv_st
         WHERE src_mblnr = @<g>-mblnr
           AND src_mjahr = @<g>-mjahr
           AND src_zeile = @<g>-zeile.
@@ -191,7 +194,7 @@ CLASS lcl_mon IMPLEMENTATION.
                       start_time = sy-uzeit
                       status     = 'R'
                       ernam      = sy-uname ).
-    MODIFY zmm_301_mov_run_log FROM @ms_run.
+    MODIFY zptp_301_movrlog FROM @ms_run.
     COMMIT WORK.
   ENDMETHOD.
 
@@ -203,7 +206,7 @@ CLASS lcl_mon IMPLEMENTATION.
     CONVERT DATE ms_run-start_date TIME ms_run-start_time INTO TIME STAMP t1 TIME ZONE sy-zonlo.
     CONVERT DATE ms_run-end_date   TIME ms_run-end_time   INTO TIME STAMP t2 TIME ZONE sy-zonlo.
     ms_run-duration_s = cl_abap_tstmp=>subtract( tstmp1 = t2 tstmp2 = t1 ).
-    MODIFY zmm_301_mov_run_log FROM @ms_run.
+    MODIFY zptp_301_movrlog FROM @ms_run.
     COMMIT WORK.
   ENDMETHOD.
 
@@ -231,18 +234,18 @@ CLASS lcl_mon IMPLEMENTATION.
 
   METHOD schedule_next.
     DATA: lv_date TYPE d, lv_time TYPE t, lv_ts TYPE timestamp,
-          lv_job TYPE btcjob VALUE 'ZMM301M_CHAIN', lv_cnt TYPE btcjobcnt.
+          lv_job TYPE btcjob VALUE 'ZPTP_301_MON_CHAIN', lv_cnt TYPE btcjobcnt.
     lv_date = sy-datum. lv_time = sy-uzeit.
     CONVERT DATE lv_date TIME lv_time INTO TIME STAMP lv_ts TIME ZONE sy-zonlo.
-    lv_ts = cl_abap_tstmp=>add( tstmp = lv_ts secs = interval_secs( ) ).
+    lv_ts = cl_abap_tstmp=>add_to_short( tstmp = lv_ts secs = interval_secs( ) ).
     CONVERT TIME STAMP lv_ts TIME ZONE sy-zonlo INTO DATE lv_date TIME lv_time.
 
     CALL FUNCTION 'JOB_OPEN'
       EXPORTING jobname = lv_job IMPORTING jobcount = lv_cnt
       EXCEPTIONS OTHERS = 1.
     IF sy-subrc <> 0. RETURN. ENDIF.
-    SUBMIT zmm_r_301_mov_monitor
-      WITH p_werk_fr = p_werk_fr
+    SUBMIT zptp_301_movement_monitor
+      WITH p_werkfr = p_werkfr
       WITH so_budat  IN so_budat
       WITH p_mode    = 'C'
       WITH p_sched   = p_sched
@@ -253,7 +256,7 @@ CLASS lcl_mon IMPLEMENTATION.
       EXPORTING jobcount = lv_cnt jobname = lv_job
                 sdlstrtdt = lv_date sdlstrttm = lv_time
       EXCEPTIONS OTHERS = 1.
-    MESSAGE s013(zmm301) WITH lv_date lv_time.
+    MESSAGE s039(zptp_split_val) WITH lv_date lv_time.
   ENDMETHOD.
 
   METHOD run_id.
@@ -265,6 +268,26 @@ CLASS lcl_mon IMPLEMENTATION.
   ENDMETHOD.
 
 ENDCLASS.
+
+*---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+  " listbox values for the processing mode and the frequency unit
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'P_MODE'
+      values = VALUE vrm_values( ( key = 'M' text = TEXT-m01 )
+                                 ( key = 'P' text = TEXT-m02 )
+                                 ( key = 'C' text = TEXT-m03 ) )
+    EXCEPTIONS
+      OTHERS = 1.
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'P_FUNIT'
+      values = VALUE vrm_values( ( key = 'MIN' text = TEXT-l01 )
+                                 ( key = 'HRS' text = TEXT-l02 )
+                                 ( key = 'DAY' text = TEXT-l03 ) )
+    EXCEPTIONS
+      OTHERS = 1.
 
 *---------------------------------------------------------------------*
 START-OF-SELECTION.
