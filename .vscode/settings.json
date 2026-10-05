@@ -5,5 +5,5 @@
             "matchCommandLine": true
         }
     },
-    "claudeCode.useTerminal": true
+    "claudeCode.useTerminal": false
 }
