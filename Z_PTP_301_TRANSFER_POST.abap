@@ -237,6 +237,90 @@ FUNCTION z_ptp_301_transfer_post.
   ls_log-rspos = lv_respo.
 
 *--------------------------------------------------------------------*
+* 6b) Make sure the batch exists in the destination plant. If not,
+*     create it from the source-plant batch (BAPI_BATCH_CREATE) and
+*     assign the destination valuation type to it.
+*--------------------------------------------------------------------*
+  DATA lv_batch_note TYPE string.
+  FIELD-SYMBOLS <lv_batch_bwtar> TYPE data.
+
+  IF ls_seg-charg IS NOT INITIAL.
+    SELECT SINGLE @abap_true FROM mcha INTO @DATA(lv_batch_found)
+      WHERE matnr = @ls_seg-matnr
+        AND werks = @ls_ctrl-werks_to
+        AND charg = @ls_seg-charg.
+    IF sy-subrc <> 0.
+      " destination plant must manage this material in batches
+      SELECT SINGLE xchpf FROM marc INTO @DATA(lv_xchpf)
+        WHERE matnr = @ls_seg-matnr AND werks = @ls_ctrl-werks_to.
+      IF sy-subrc <> 0 OR lv_xchpf IS INITIAL.
+        ls_log-status  = 'E'.
+        ls_log-message = |Material not batch-managed in plant { ls_ctrl-werks_to } – batch { ls_seg-charg } cannot be created|.
+        _persist_log.
+        RETURN.
+      ENDIF.
+
+      " source batch data
+      DATA: ls_batatt  TYPE bapibatchatt,
+            ls_batatt_new TYPE bapibatchatt,
+            lt_ret_b   TYPE STANDARD TABLE OF bapiret2,
+            lt_ret_b2  TYPE STANDARD TABLE OF bapiret2,
+            lv_batch_new TYPE charg_d.
+
+      CALL FUNCTION 'BAPI_BATCH_GET_DETAIL'
+        EXPORTING
+          material_long = ls_seg-matnr
+          batch         = ls_seg-charg
+          plant         = ls_seg-werks
+        IMPORTING
+          batchattributes = ls_batatt
+        TABLES
+          return        = lt_ret_b.
+      IF line_exists( lt_ret_b[ type = 'E' ] ) OR line_exists( lt_ret_b[ type = 'A' ] ).
+        ls_log-status  = 'E'.
+        ls_log-message = |Source batch { ls_seg-charg } read error: { VALUE #( lt_ret_b[ type = 'E' ]-message DEFAULT `unknown` ) }|.
+        _persist_log.
+        RETURN.
+      ENDIF.
+
+      " copy source attributes, then add the destination valuation type
+      ls_batatt_new = ls_batatt.
+      ASSIGN COMPONENT 'VAL_TYPE' OF STRUCTURE ls_batatt_new TO <lv_batch_bwtar>.
+      IF sy-subrc <> 0.
+        ASSIGN COMPONENT 'BWTAR' OF STRUCTURE ls_batatt_new TO <lv_batch_bwtar>.
+      ENDIF.
+      IF <lv_batch_bwtar> IS ASSIGNED.
+        <lv_batch_bwtar> = lv_valtype.
+      ELSE.
+        " BAPI structure has no valuation-type field: the 301 posting
+        " (MOVE_VAL_TYPE) will still stamp it when the batch is first used
+        lv_batch_note = | (batch valuation type not set by BAPI_BATCH_CREATE)|.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_BATCH_CREATE'
+        EXPORTING
+          material_long   = ls_seg-matnr
+          batch           = ls_seg-charg
+          plant           = ls_ctrl-werks_to
+          batchattributes = ls_batatt_new
+        IMPORTING
+          batch           = lv_batch_new
+        TABLES
+          return          = lt_ret_b2.
+      IF line_exists( lt_ret_b2[ type = 'E' ] ) OR line_exists( lt_ret_b2[ type = 'A' ] ).
+        IF iv_commit = abap_true.
+          CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        ENDIF.
+        ls_log-status  = 'E'.
+        ls_log-message = |Batch { ls_seg-charg } create error in plant { ls_ctrl-werks_to }: { VALUE #( lt_ret_b2[ type = 'E' ]-message DEFAULT `unknown` ) }|.
+        _persist_log.
+        RETURN.
+      ENDIF.
+      " no COMMIT here: batch is created in the same LUW as the 301 posting
+    ENDIF.
+  ENDIF.
+
+*--------------------------------------------------------------------*
 * 7) Post the 301 transfer via BAPI_GOODS_MOVEMENT_CREATE
 *--------------------------------------------------------------------*
   DATA: ls_head TYPE bapi2017_gm_head_01,
@@ -302,7 +386,7 @@ FUNCTION z_ptp_301_transfer_post.
     ls_log-status    = 'S'.
     ls_log-mov_mblnr = lv_matdoc.
     ls_log-mov_mjahr = lv_matyr.
-    ls_log-message   = |301 doc { lv_matdoc } posted (valtype { lv_valtype })|.
+    ls_log-message   = |301 doc { lv_matdoc } posted (valtype { lv_valtype }){ lv_batch_note }|.
   ENDIF.
 
   _persist_log.
