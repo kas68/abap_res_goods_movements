@@ -1,21 +1,31 @@
 *&---------------------------------------------------------------------*
 *& Report  ZPTP_301_RESERVATION_GENERATOR
 *&---------------------------------------------------------------------*
-*& FS-MM-301RES-001 : Create / align 301 transfer reservations for open
-*&                    production orders (origin plant -> destination plant)
+*& Create / align 301 transfer reservations for open production orders
+*& (origin plant 8P01 -> destination plant 8Q01).
 *&
-*& Migration 8P01 -> 8Q01. Reservation remaining (BDMNG - ENMNG) is kept
-*& equal to PO remaining (PSMNG - WEMNG). The physical 301 movements that
-*& consume the reservation are posted by the companion object
-*& (FS-MM-301MOV-001), NOT by this program.
+*& Reservation remaining (BDMNG - ENMNG) is kept equal to PO remaining
+*& (PSMNG - WEMNG). The 301 movements that consume the reservation are posted
+*& by report ZPTP_301_RESERVATION_TRANSFER, NOT by this program.
 *&
 *& Finished product (AFPO-MATNR, 8P01 -> 8Q01): released orders only.
 *& Optional raw materials (P_RAWMAT, 8Q01 -> 8P01): open orders (created
 *& or released). The short components of an order go into their own
 *& reservation, independent of the finished-product reservation.
 *&
+*& Storage locations: source = storage location of the order (AFPO-LGORT);
+*& target = table ZPTP_301_LGORT (direction, plant pair, source storage
+*& location, material type). Storage locations typed on the selection screen
+*& override.
+*&
+*& Collective orders (option P_COLL): finished product only for the leading
+*& order, components only for the lowest-level order.
+*& Exclusion list (option P_EXCL): orders listed in table ZPTP_301_EXCL get
+*& no finished-product / component reservation; the list is loaded from a
+*& local .xlsx at an online run and then read from the table by every run.
+*&
 *& NOTE: BAPI field names for the reservation change/close path should be
-*&       verified against the target release (see FS Open Issue O4).
+*&       verified against the target release.
 *&---------------------------------------------------------------------*
 REPORT zptp_301_reservation_generator.
 
@@ -67,6 +77,12 @@ PARAMETERS: p_werkrf TYPE werks_d DEFAULT '8Q01'              " RM source plant 
                      MODIF ID raw,
             p_lgorrt TYPE lgort_d MODIF ID raw.               " RM target stor.loc
 SELECTION-SCREEN END OF BLOCK b5.
+
+SELECTION-SCREEN BEGIN OF BLOCK b6 WITH FRAME TITLE TEXT-006. " Collective orders / exclusions
+PARAMETERS: p_coll AS CHECKBOX,                                " collective orders: leading / lowest level only
+            p_excl AS CHECKBOX USER-COMMAND exl,               " apply the exclusion list (ZPTP_301_EXCL)
+            p_file TYPE rlgrap-filename MODIF ID exl.          " spreadsheet (.xlsx) to upload from local PC
+SELECTION-SCREEN END OF BLOCK b6.
 
 *---------------------------------------------------------------------*
 * Global constants
@@ -137,19 +153,69 @@ CLASS lcl_app DEFINITION FINAL.
              meins TYPE meins,
              elikz TYPE elikz,
              dispo TYPE dispo,
+             lgort TYPE lgort_d,            " storage location of the order item (AFPO-LGORT)
              rel   TYPE abap_bool,          " order released (REL)
            END OF ty_ord.
     TYPES tt_ord TYPE STANDARD TABLE OF ty_ord WITH DEFAULT KEY.
 
-    DATA: mt_out    TYPE tt_out,
+    TYPES: BEGIN OF ty_coll,
+             aufnr  TYPE aufnr,
+             lead   TYPE abap_bool,          " leading (top) order, or not collective
+             lowest TYPE abap_bool,          " lowest-level order, or not collective
+           END OF ty_coll.
+
+    TYPES: BEGIN OF ty_lgort,
+             kind     TYPE c LENGTH 1,
+             matnr    TYPE matnr,
+             werks_fr TYPE werks_d,
+             werks_to TYPE werks_d,
+             lgort_fr TYPE lgort_d,          " source storage location (lookup key)
+             lgort_to TYPE lgort_d,          " target storage location (result)
+           END OF ty_lgort.
+
+    DATA: mt_lgort  TYPE SORTED TABLE OF ty_lgort
+                         WITH UNIQUE KEY kind matnr werks_fr werks_to lgort_fr,       " cache
+          mt_coll   TYPE SORTED TABLE OF ty_coll WITH UNIQUE KEY aufnr,   " cache
+          mt_excl   TYPE SORTED TABLE OF zptp_301_excl WITH UNIQUE KEY aufnr,
+          mt_out    TYPE tt_out,
           mv_run_id TYPE sysuuid_c32,
           mv_mode   TYPE c LENGTH 1,    " O / B
           ms_counts TYPE zptp_301_run_log.
 
     METHODS validate_selection.
+    " Storage locations of a reservation item. Source: the storage location of
+    " the order (IV_SRC) unless overridden on the screen. Target: table
+    " ZPTP_301_LGORT read with the source storage location, unless overridden.
+    METHODS resolve_lgort
+      IMPORTING iv_kind     TYPE c
+                iv_matnr    TYPE matnr
+                iv_werks_fr TYPE werks_d
+                iv_werks_to TYPE werks_d
+                iv_src      TYPE lgort_d
+                iv_ovr_fr   TYPE lgort_d
+                iv_ovr_to   TYPE lgort_d
+      EXPORTING ev_lgor_fr  TYPE lgort_d
+                ev_lgor_to  TYPE lgort_d.
+    METHODS check_lgort_table.
     METHODS interval_in_seconds RETURNING VALUE(rv_secs) TYPE i.
     METHODS select_open_orders
       RETURNING VALUE(rt_orders) TYPE tt_ord.
+    " Option 1 : collective orders (leading order / lowest level)
+    METHODS collective_role
+      IMPORTING iv_aufnr TYPE aufnr
+      RETURNING VALUE(rs_role) TYPE ty_coll.
+    " Option 2 : exclusion list (uploaded spreadsheet, kept in ZPTP_301_EXCL)
+    METHODS load_exclusions.
+    METHODS upload_exclusions.
+    " Reason text if the order must NOT get a reservation of this kind, else blank
+    METHODS exclusion_reason
+      IMPORTING iv_kind        TYPE c
+                iv_aufnr       TYPE aufnr
+      RETURNING VALUE(rv_text) TYPE string.
+    METHODS log_skip
+      IMPORTING is_order TYPE ty_ord
+                iv_kind  TYPE c
+                iv_text  TYPE string.
     METHODS process_order
       IMPORTING is_order TYPE ty_ord.
     METHODS process_raw_components
@@ -203,6 +269,7 @@ CLASS lcl_app IMPLEMENTATION.
     validate_selection( ).
     start_run_log( ).
 
+    load_exclusions( ).
     DATA(lt_orders) = select_open_orders( ).
     ms_counts-cnt_selected = lines( lt_orders ).
 
@@ -286,30 +353,76 @@ CLASS lcl_app IMPLEMENTATION.
       SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werkrt.
       IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkrt. ENDIF.
     ENDIF.
+    check_lgort_table( ).
+  ENDMETHOD.
 
-    " authorization: create goods movement/reservation for the plants & mvt 301
-    AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
-      ID 'ACTVT' FIELD '01'
-      ID 'BWART' FIELD gc_mvt_301
-      ID 'WERKS' FIELD p_werkfr.
-    IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkfr. ENDIF.
-    AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
-      ID 'ACTVT' FIELD '01'
-      ID 'BWART' FIELD gc_mvt_301
-      ID 'WERKS' FIELD p_werkto.
-    IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkto. ENDIF.
+*---------------------------------------------------------------------*
+  METHOD check_lgort_table.
+    " Storage locations maintained in ZPTP_301_LGORT for the plant pair(s) of
+    " this run must exist in the plant.
+    DATA lt_chk TYPE STANDARD TABLE OF zptp_301_lgort WITH DEFAULT KEY.
+
+    SELECT * FROM zptp_301_lgort INTO TABLE @lt_chk
+      WHERE res_kind = @gc_kind_h
+        AND werks_fr = @p_werkfr
+        AND werks_to = @p_werkto.
     IF p_rawmat = abap_true.
-      AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
-        ID 'ACTVT' FIELD '01'
-        ID 'BWART' FIELD gc_mvt_301
-        ID 'WERKS' FIELD p_werkrf.
-      IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkrf. ENDIF.
-      AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
-        ID 'ACTVT' FIELD '01'
-        ID 'BWART' FIELD gc_mvt_301
-        ID 'WERKS' FIELD p_werkrt.
-      IF sy-subrc <> 0. MESSAGE e044(zptp_split_val) WITH p_werkrt. ENDIF.
+      SELECT * FROM zptp_301_lgort APPENDING TABLE @lt_chk
+        WHERE res_kind = @gc_kind_r
+          AND werks_fr = @p_werkrf
+          AND werks_to = @p_werkrt.
     ENDIF.
+
+    LOOP AT lt_chk ASSIGNING FIELD-SYMBOL(<l>).
+      IF <l>-lgort_fr IS NOT INITIAL.
+        SELECT SINGLE lgort FROM t001l INTO @DATA(lv_l)
+          WHERE werks = @<l>-werks_fr AND lgort = @<l>-lgort_fr.
+        IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH <l>-lgort_fr <l>-werks_fr. ENDIF.
+      ENDIF.
+      IF <l>-lgort_to IS NOT INITIAL.
+        SELECT SINGLE lgort FROM t001l INTO @lv_l
+          WHERE werks = @<l>-werks_to AND lgort = @<l>-lgort_to.
+        IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH <l>-lgort_to <l>-werks_to. ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD resolve_lgort.
+    " Source storage location: screen override, else the one given by the order.
+    " Target storage location: screen override, else table ZPTP_301_LGORT read
+    "   with kind + plant pair + source storage location + material type. The most
+    "   specific entry wins: source storage location first (blank = any), then
+    "   material type (blank = all). No entry -> blank.
+    ev_lgor_fr = COND #( WHEN iv_ovr_fr IS NOT INITIAL THEN iv_ovr_fr ELSE iv_src ).
+    ev_lgor_to = iv_ovr_to.
+    IF iv_ovr_to IS NOT INITIAL.
+      RETURN.
+    ENDIF.
+
+    READ TABLE mt_lgort INTO DATA(ls_c)
+         WITH KEY kind = iv_kind matnr = iv_matnr
+                  werks_fr = iv_werks_fr werks_to = iv_werks_to
+                  lgort_fr = ev_lgor_fr.
+    IF sy-subrc <> 0.
+      ls_c = VALUE #( kind = iv_kind matnr = iv_matnr
+                      werks_fr = iv_werks_fr werks_to = iv_werks_to
+                      lgort_fr = ev_lgor_fr ).
+      SELECT SINGLE mtart FROM mara INTO @DATA(lv_mtart) WHERE matnr = @iv_matnr.
+      SELECT lgort_to FROM zptp_301_lgort
+        WHERE res_kind = @iv_kind
+          AND werks_fr = @iv_werks_fr
+          AND werks_to = @iv_werks_to
+          AND ( lgort_fr = @ev_lgor_fr OR lgort_fr = @space )
+          AND ( mtart    = @lv_mtart   OR mtart    = @space )
+        ORDER BY lgort_fr DESCENDING, mtart DESCENDING
+        INTO @ls_c-lgort_to
+        UP TO 1 ROWS.
+      ENDSELECT.
+      INSERT ls_c INTO TABLE mt_lgort.
+    ENDIF.
+
+    ev_lgor_to = ls_c-lgort_to.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -327,7 +440,7 @@ CLASS lcl_app IMPLEMENTATION.
     DATA lt_ord TYPE tt_ord.
 
     SELECT k~aufnr, k~auart, k~objnr,
-           p~posnr, p~matnr, p~psmng, p~wemng, p~meins, p~elikz,
+           p~posnr, p~matnr, p~psmng, p~wemng, p~meins, p~elikz, p~lgort,
            f~dispo
       FROM aufk AS k
       INNER JOIN afko AS f ON f~aufnr = k~aufnr
@@ -336,6 +449,7 @@ CLASS lcl_app IMPLEMENTATION.
       WHERE k~werks   = @p_werkfr
         AND k~aufnr  IN @so_aufnr
         AND k~auart  IN @so_auart
+        AND p~posnr   = '0001'                " header item only (no co-products)
         AND p~matnr  IN @so_matnr
         AND f~dispo  IN @so_dispo
         AND p~elikz   = @space.               " delivery not completed
@@ -385,6 +499,22 @@ CLASS lcl_app IMPLEMENTATION.
     DATA(lv_to_close) = xsdbool( is_order-elikz = 'C' ).   " TECO/CLSD flag
     DATA(lv_po_open)  = CONV menge_d( is_order-psmng - is_order-wemng ).
 
+    DATA(lv_skip) = exclusion_reason( iv_kind = gc_kind_h iv_aufnr = is_order-aufnr ).
+    IF lv_skip IS NOT INITIAL.
+      log_skip( is_order = is_order iv_kind = gc_kind_h iv_text = lv_skip ).
+      RETURN.
+    ENDIF.
+
+    resolve_lgort( EXPORTING iv_kind     = gc_kind_h
+                             iv_matnr    = is_order-matnr
+                             iv_werks_fr = p_werkfr
+                             iv_werks_to = p_werkto
+                             iv_src      = is_order-lgort
+                             iv_ovr_fr   = p_lgorfr
+                             iv_ovr_to   = p_lgorto
+                   IMPORTING ev_lgor_fr  = DATA(lv_lgor_fr)
+                             ev_lgor_to  = DATA(lv_lgor_to) ).
+
     reconcile_item(
       iv_kind     = gc_kind_h
       iv_aufnr    = is_order-aufnr
@@ -393,9 +523,9 @@ CLASS lcl_app IMPLEMENTATION.
       iv_basis    = lv_po_open
       iv_meins    = is_order-meins
       iv_werks_fr = p_werkfr
-      iv_lgor_fr  = p_lgorfr
+      iv_lgor_fr  = lv_lgor_fr
       iv_werks_to = p_werkto
-      iv_lgor_to  = p_lgorto
+      iv_lgor_to  = lv_lgor_to
       iv_to_close = lv_to_close
       iv_wemng    = is_order-wemng ).
   ENDMETHOD.
@@ -408,6 +538,12 @@ CLASS lcl_app IMPLEMENTATION.
     DATA lt_new TYPE tt_out.
     DATA(lv_to_close) = xsdbool( is_order-elikz = 'C' ).
 
+    DATA(lv_skip) = exclusion_reason( iv_kind = gc_kind_r iv_aufnr = is_order-aufnr ).
+    IF lv_skip IS NOT INITIAL.
+      log_skip( is_order = is_order iv_kind = gc_kind_r iv_text = lv_skip ).
+      RETURN.
+    ENDIF.
+
     " Open component requirements of the production order.
     " POSTP = 'L' -> stock item only (excludes non-stock 'N', text 'T', phantom).
     SELECT rspos, matnr, bdmng, enmng, meins, werks, bdter
@@ -416,6 +552,7 @@ CLASS lcl_app IMPLEMENTATION.
         AND werks = @p_werkrt          " requirement at the production plant
         AND matnr <> @space
         AND postp = 'L'                " stock item
+        AND shkzg = 'H'                " issue only (excludes by-products, receipts)
         AND xloek = @space             " not deleted
         AND dumps = @space             " not a phantom assembly
         AND kzear = @space.            " not final-issued
@@ -430,6 +567,16 @@ CLASS lcl_app IMPLEMENTATION.
       DATA(lv_short) = CONV menge_d( lv_req - lv_stock ).
       IF lv_short < 0. lv_short = 0. ENDIF.
 
+      resolve_lgort( EXPORTING iv_kind     = gc_kind_r
+                               iv_matnr    = <c>-matnr
+                               iv_werks_fr = p_werkrf
+                               iv_werks_to = p_werkrt
+                               iv_src      = space      " no source location in the order (8Q01 side)
+                               iv_ovr_fr   = p_lgorrf
+                               iv_ovr_to   = p_lgorrt
+                     IMPORTING ev_lgor_fr  = DATA(lv_rm_fr)
+                               ev_lgor_to  = DATA(lv_rm_to) ).
+
       " short = 0 -> reconcile_item closes an existing RM item;
       " short > 0 -> realigns it, or collects the component in LT_NEW.
       reconcile_item(
@@ -441,22 +588,197 @@ CLASS lcl_app IMPLEMENTATION.
           iv_basis    = lv_short
           iv_meins    = <c>-meins
           iv_werks_fr = p_werkrf         " issuing = new plant (8Q01)
-          iv_lgor_fr  = p_lgorrf
+          iv_lgor_fr  = lv_rm_fr
           iv_werks_to = p_werkrt         " receiving = production plant (8P01)
-          iv_lgor_to  = p_lgorrt
+          iv_lgor_to  = lv_rm_to
           iv_to_close = COND #( WHEN lv_short <= 0 THEN abap_true ELSE lv_to_close )
         CHANGING
           ct_new      = lt_new ).
     ENDLOOP.
 
-    " one RM reservation for all newly short components of this order
+    " One RM reservation for all newly short components of this order. The
+    " receiving storage location is a reservation header field, so components
+    " with a different receiving storage location go into separate reservations.
     IF lt_new IS NOT INITIAL.
-      create_reservation( CHANGING ct_out = lt_new ).
+      DATA: lt_grp  TYPE tt_out,
+            lt_done TYPE tt_out.
+      SORT lt_new BY lgort_to.
       LOOP AT lt_new ASSIGNING FIELD-SYMBOL(<n>).
-        APPEND <n> TO mt_out.
-        write_detail_log( <n> ).
+        IF lt_grp IS NOT INITIAL AND <n>-lgort_to <> lt_grp[ 1 ]-lgort_to.
+          create_reservation( CHANGING ct_out = lt_grp ).
+          APPEND LINES OF lt_grp TO lt_done.
+          CLEAR lt_grp.
+        ENDIF.
+        APPEND <n> TO lt_grp.
+      ENDLOOP.
+      IF lt_grp IS NOT INITIAL.
+        create_reservation( CHANGING ct_out = lt_grp ).
+        APPEND LINES OF lt_grp TO lt_done.
+      ENDIF.
+      LOOP AT lt_done ASSIGNING FIELD-SYMBOL(<d>).
+        APPEND <d> TO mt_out.
+        write_detail_log( <d> ).
       ENDLOOP.
     ENDIF.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD collective_role.
+    " Collective order hierarchy from AFKO:
+    "   PRODNET = 'X' : order is part of a collective order
+    "   MAUFNR        : number of the superior order (blank on the leading order)
+    "   leading order : part of a collective order, no superior order
+    "   lowest level  : part of a collective order, no order has it as superior
+    " An order that is not part of a collective order is both (normal behaviour).
+    READ TABLE mt_coll INTO rs_role WITH KEY aufnr = iv_aufnr.
+    IF sy-subrc = 0.
+      RETURN.
+    ENDIF.
+
+    rs_role-aufnr  = iv_aufnr.
+    rs_role-lead   = abap_true.
+    rs_role-lowest = abap_true.
+
+    SELECT SINGLE maufnr, prodnet FROM afko INTO @DATA(ls_afko)
+      WHERE aufnr = @iv_aufnr.
+    IF sy-subrc = 0 AND ls_afko-prodnet = abap_true.
+      SELECT SINGLE aufnr FROM afko INTO @DATA(lv_below)
+        WHERE maufnr = @iv_aufnr.
+      rs_role-lead   = xsdbool( ls_afko-maufnr IS INITIAL ).
+      rs_role-lowest = xsdbool( sy-subrc <> 0 ).
+    ENDIF.
+    INSERT rs_role INTO TABLE mt_coll.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD exclusion_reason.
+    " Option 1 : collective orders
+    IF p_coll = abap_true.
+      DATA(ls_role) = collective_role( iv_aufnr ).
+      IF iv_kind = gc_kind_h AND ls_role-lead = abap_false.
+        rv_text = 'Collective order: not the leading order'.
+        RETURN.
+      ENDIF.
+      IF iv_kind = gc_kind_r AND ls_role-lowest = abap_false.
+        rv_text = 'Collective order: not the lowest-level order'.
+        RETURN.
+      ENDIF.
+    ENDIF.
+    " Option 2 : exclusion list
+    IF p_excl = abap_true.
+      READ TABLE mt_excl INTO DATA(ls_excl) WITH KEY aufnr = iv_aufnr.
+      IF sy-subrc = 0.
+        IF ( iv_kind = gc_kind_h AND ls_excl-excl_h = abap_true )
+        OR ( iv_kind = gc_kind_r AND ls_excl-exclr = abap_true ).
+          rv_text = 'Order on exclusion list'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD log_skip.
+    " Visible in the ALV and the detail log, like 'Fully received'.
+    " Existing reservations of a skipped order are left untouched.
+    DATA(ls_out) = VALUE ty_out(
+      res_kind = iv_kind
+      aufnr    = is_order-aufnr
+      auart    = is_order-auart
+      posnr    = COND #( WHEN iv_kind = gc_kind_h THEN '0001' ELSE '0000' )
+      matnr    = COND #( WHEN iv_kind = gc_kind_h THEN is_order-matnr )
+      meins    = is_order-meins
+      status   = gc_skipped
+      statxt   = iv_text ).
+    APPEND ls_out TO mt_out.
+    write_detail_log( ls_out ).
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD load_exclusions.
+    IF p_excl = abap_false.
+      RETURN.
+    ENDIF.
+    " online run with a file: replace the stored list with the spreadsheet
+    IF p_file IS NOT INITIAL.
+      upload_exclusions( ).
+    ENDIF.
+    " every run (online / background chain) reads the stored list
+    SELECT * FROM zptp_301_excl INTO TABLE @mt_excl.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD upload_exclusions.
+    " Spreadsheet (.xlsx) layout - column A, row 1 may be a header:
+    "   worksheet 1 : production orders WITHOUT finished-product reservation (8P01 -> 8Q01)
+    "   worksheet 2 : production orders WITHOUT component reservation        (8Q01 -> 8P01)
+    " The upload REPLACES the stored list (the file is the complete list).
+    IF sy-batch = abap_true.
+      MESSAGE 'The exclusion file can only be uploaded online' TYPE 'E'.
+    ENDIF.
+
+    DATA: lt_bin  TYPE solix_tab,
+          lv_len  TYPE i,
+          lt_new  TYPE SORTED TABLE OF zptp_301_excl WITH UNIQUE KEY aufnr.
+
+    cl_gui_frontend_services=>gui_upload(
+      EXPORTING  filename   = CONV string( p_file )
+                 filetype   = 'BIN'
+      IMPORTING  filelength = lv_len
+      CHANGING   data_tab   = lt_bin
+      EXCEPTIONS OTHERS     = 1 ).
+    IF sy-subrc <> 0.
+      MESSAGE 'Exclusion file cannot be read' TYPE 'E'.
+    ENDIF.
+    DATA(lv_xstr) = cl_bcs_convert=>solix_to_xstring( it_solix = lt_bin iv_size = lv_len ).
+
+    TRY.
+        DATA(lo_xl) = NEW cl_fdt_xl_spreadsheet( document_name = CONV string( p_file )
+                                                 xdocument     = lv_xstr ).
+        lo_xl->if_fdt_doc_spreadsheet~get_worksheet_names(
+          IMPORTING worksheet_names = DATA(lt_sheets) ).
+        IF lines( lt_sheets ) < 2.
+          MESSAGE 'The file needs two worksheets (finished product / components)' TYPE 'E'.
+        ENDIF.
+
+        DO 2 TIMES.
+          DATA(lv_sheet) = sy-index.
+          DATA(lr_data) = lo_xl->if_fdt_doc_spreadsheet~get_itab_from_worksheet(
+                            lt_sheets[ lv_sheet ] ).
+          ASSIGN lr_data->* TO FIELD-SYMBOL(<tab>).
+          LOOP AT <tab> ASSIGNING FIELD-SYMBOL(<row>).
+            ASSIGN COMPONENT 1 OF STRUCTURE <row> TO FIELD-SYMBOL(<cell>).
+            IF sy-subrc <> 0.
+              CONTINUE.
+            ENDIF.
+            DATA(lv_txt) = condense( CONV string( <cell> ) ).
+            REPLACE PCRE '\.0+$' IN lv_txt WITH ''.         " 1000123.0 -> 1000123
+            IF lv_txt IS INITIAL OR lv_txt CN '0123456789'.   " header / junk row
+              CONTINUE.
+            ENDIF.
+            DATA lv_aufnr TYPE aufnr.
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+              EXPORTING input  = lv_txt
+              IMPORTING output = lv_aufnr.
+            ASSIGN lt_new[ aufnr = lv_aufnr ] TO FIELD-SYMBOL(<n>).
+            IF sy-subrc <> 0.
+              INSERT VALUE #( aufnr = lv_aufnr ) INTO TABLE lt_new ASSIGNING <n>.
+            ENDIF.
+            IF lv_sheet = 1. <n>-excl_h = abap_true. ELSE. <n>-exclr = abap_true. ENDIF.
+          ENDLOOP.
+        ENDDO.
+      CATCH cx_root INTO DATA(lx).
+        MESSAGE lx->get_text( ) TYPE 'E'.
+    ENDTRY.
+
+    LOOP AT lt_new ASSIGNING FIELD-SYMBOL(<u>).
+      <u>-upl_date = sy-datum.
+      <u>-upl_by   = sy-uname.
+    ENDLOOP.
+
+    DELETE FROM zptp_301_excl.
+    INSERT zptp_301_excl FROM TABLE @( VALUE #( FOR u IN lt_new ( u ) ) ).
+    COMMIT WORK.
+    MESSAGE |Exclusion list uploaded: { lines( lt_new ) } orders| TYPE 'S'.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -669,7 +991,7 @@ CLASS lcl_app IMPLEMENTATION.
   METHOD change_reservation.
     " Realign (BDMNG = target) or close (BDMNG = ENMNG).
     " NOTE: verify BAPI_RESERVATION_CHANGE item/itemX field names for the
-    "       target release (FS Open Issue O4). MB22 FM/BDC is the fallback.
+    "       target release. MB22 FM/BDC is the fallback.
     DATA(lv_newqty) = COND menge_d(
         WHEN iv_close = abap_true THEN cs_out-res_enmng
         ELSE cs_out-target_bdmng ).
@@ -740,7 +1062,7 @@ CLASS lcl_app IMPLEMENTATION.
                          start_time = sy-uzeit
                          status     = 'R'
                          ernam      = sy-uname
-                         sel_text   = |FR { p_werkfr } TO { p_werkto } DATE { p_rsdat }| ).
+                         sel_text   = |FR { p_werkfr } TO { p_werkto } DATE { p_rsdat } COLL { p_coll } EXCL { p_excl }| ).
     MODIFY zptp_301_run_log FROM @ms_counts.
     COMMIT WORK.
   ENDMETHOD.
@@ -842,6 +1164,8 @@ CLASS lcl_app IMPLEMENTATION.
       WITH p_lgorrf  = p_lgorrf
       WITH p_werkrt  = p_werkrt
       WITH p_lgorrt  = p_lgorrt
+      WITH p_coll    = p_coll
+      WITH p_excl    = p_excl
       VIA JOB lv_jobname NUMBER lv_jobcount
       AND RETURN.
 
@@ -880,7 +1204,24 @@ AT SELECTION-SCREEN OUTPUT.
       screen-input = COND i( WHEN p_rawmat = abap_true THEN 1 ELSE 0 ).
       MODIFY SCREEN.
     ENDIF.
+    IF screen-group1 = 'EXL'.
+      screen-input = COND i( WHEN p_excl = abap_true THEN 1 ELSE 0 ).
+      MODIFY SCREEN.
+    ENDIF.
   ENDLOOP.
+
+*---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  " local PC file picker for the exclusion spreadsheet
+  DATA: lt_files TYPE filetable, lv_rc TYPE i.
+  cl_gui_frontend_services=>file_open_dialog(
+    EXPORTING  file_filter = |Excel (*.xlsx)\|*.xlsx|
+    CHANGING   file_table  = lt_files
+               rc          = lv_rc
+    EXCEPTIONS OTHERS      = 1 ).
+  IF sy-subrc = 0 AND lv_rc = 1.
+    p_file = lt_files[ 1 ]-filename.
+  ENDIF.
 
 *---------------------------------------------------------------------*
 AT SELECTION-SCREEN.

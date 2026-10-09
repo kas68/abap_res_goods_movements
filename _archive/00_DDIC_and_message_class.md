@@ -123,18 +123,20 @@ Common settings for both tables:
 Used by: BAdI enhancement class (`WERKS_FR`, `ACTIVE`, `VALID_FROM/TO`), `Z_PTP_301_TRANSFER_POST`
 (all fields), reservation report and monitor (`ACTIVE`, stop switch for self-rescheduling).
 
-### 3.2 `ZPTP_301_VALTYPE` — fiscal year → destination valuation type
+### 3.2 `ZPTP_301_VALTYPE` — destination valuation type by plant, material type and fiscal year
 
 | Field | Key | Data element | Check table | Description |
 |---|:---:|---|---|---|
 | MANDT | X | MANDT | T000 | Client |
-| BUKRS | X | BUKRS | T001 | Company code (blank = valid for all) |
+| WERKS | X | WERKS_D | T001W | Destination plant (blank = valid for all plants) |
+| MTART | X | MTART | T134 | Material type (blank = valid for all material types) |
 | GJAHR | X | GJAHR | | Fiscal year |
-| BWTAR | | BWTAR_D | T149D | Destination valuation type for that fiscal year |
+| BWTAR | | BWTAR_D | T149D | Destination valuation type |
 | DESCR | | TEXT40 | | Comment (not translated) |
 | ACTIVE | | XFELD | | Entry active |
 
-Used by: `Z_PTP_301_TRANSFER_POST` (company-code entry wins over the blank/global one).
+Used by: `Z_PTP_301_RES_TRANSFER_POST` (most specific entry wins: destination-plant-specific over blank
+plant, then material-type-specific over blank material type).
 
 ### 3.3 Table maintenance (SE11 → Utilities → Table Maintenance Generator)
 
