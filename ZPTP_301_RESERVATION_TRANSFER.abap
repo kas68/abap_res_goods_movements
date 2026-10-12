@@ -345,6 +345,9 @@ CLASS lcl_app IMPLEMENTATION.
           <f>-qfieldname  = 'MEINS'.
         WHEN 'MATNR'.
           <f>-ref_table = 'MARA'. <f>-ref_field = 'MATNR'.
+        WHEN 'MEINS'.                                  " unit shown in the logon language
+          <f>-ref_table = 'MARA'. <f>-ref_field = 'MEINS'.
+          <f>-convexit  = 'CUNIT'.
       ENDCASE.
     ENDLOOP.
 

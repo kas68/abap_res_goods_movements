@@ -44,7 +44,7 @@ The process works in two separate steps:
 | Flow | Direction | What is reserved | For which orders |
 |---|---|---|---|
 | **Finished product** | 8P01 → 8Q01 | The finished material of the order, for the quantity not yet delivered | **Released** orders |
-| **Raw materials** (optional) | 8Q01 → 8P01 | The components of the order that 8P01 is **short of** | **Open** orders (created or released) |
+| **Raw materials** (selected with *Reservation kind* R or A) | 8Q01 → 8P01 | The components of the order that 8P01 is **short of** | **Open** orders (created or released) |
 
 The two flows have **separate reservations**. A finished-product reservation and a raw-material reservation for the same order never mix.
 
@@ -101,7 +101,7 @@ When the goods are transferred to 8Q01, the receiving stock gets the **valuation
 ## 2. Reservation generator — `ZPTP_301_RES`
 
 ### 2.1 Before you start
-- Decide whether you only want to **see what would happen** (test run) or really create reservations. The **Test run** box is ticked by default. Nothing is created or changed while it is ticked.
+- Choose the **run mode** (section 2.2): **1 Test** only shows what would happen, **2 Online** (default) shows the test result and lets you create the reservations of the production orders you tick, **3 Background** creates all reservations.
 - Always run a test first when you change the selection, the options, or the exclusion list.
 
 ### 2.2 The selection screen
@@ -118,7 +118,7 @@ When the goods are transferred to 8Q01, the receiving stock gets the **valuation
 The two plants must be different.
 
 **Where the storage locations of a new reservation come from**
-- **Source (issuing) storage location:** the one typed here (override), otherwise the storage location of the production order (finished product). For raw materials the order has no source storage location, so only the field on the screen applies.
+- **Source (issuing) storage location:** the one typed here (override), otherwise the storage location of the production order (finished product). For raw materials the order has no source storage location, so only the field on the screen applies. If still unknown, the program tries the storage locations of the source plant that hold the material, starting with the one with the most unrestricted stock, and takes the first one for which the table gives a target storage location. If none gives a target, the source is the storage location with the most unrestricted stock (empty if there is no stock) and the target stays empty.
 - **Target (receiving) storage location:** the one typed here (override), otherwise the key user's table `ZPTP_301_LGORT`. It is read with the direction, the plants, the **source storage location** and the material type, and returns the target storage location.
 - If nothing is found, the reservation has no storage location on that side.
 
@@ -141,36 +141,52 @@ If you leave the selection fields empty, **all** open orders of the origin plant
 | Field | Meaning | Default |
 |---|---|---|
 | Movement allowed | New reservations are marked as *movement allowed* | ticked |
-| Test run (simulation) | Show the result without creating or changing anything | **ticked** |
 | Reprocess errors only | Only process items whose last run ended in error | not ticked |
+| Extend material to target storage location | When the material does not exist in the target storage location, the program extends it there (copying the data of the source storage location) before creating the reservation | **ticked** |
+| Clean all logs | Before the run, deletes **all** rows of the run log and of the reservation log. Online it asks for confirmation. Ignored in test mode. Afterwards *Reprocess errors only* has no error history to work with. | not ticked |
 
-**Scheduling** — see section 2.6.
+**Run mode** (in the *Run control* block; choose one)
+
+| Mode | What happens |
+|---|---|
+| **1 Test** | Simulation of all selected orders. Nothing is created, changed or logged. The result list is only shown. |
+| **2 Online** (default) | The program first shows the same result list as the test mode, with a **checkbox "Create" on the left of each line**. Tick the lines of the production orders you want, then press **Create reservations** in the toolbar. See section 2.3. Not possible in the background. |
+| **3 Background** | All reservations are created, realigned or closed. This mode can run as a background job (schedule it in SM36 / F9 with a variant). If you run it online, the result list is shown at the end. |
 
 **Raw materials**
 
 | Field | Meaning | Default |
 |---|---|---|
-| Also reserve raw materials | Also create the 8Q01 → 8P01 reservations for short components | not ticked |
+| Reservation kind (run control) | `H` = finished products only, `R` = components (raw materials) only, `A` = all. Raw-material reservations (8Q01 → 8P01) are created for `R` and `A`. | A |
 | RM issuing plant / storage location | Plant that sends the raw material; the storage location is an optional override | 8Q01 |
 | RM receiving plant / storage location | Plant that receives the raw material; the storage location is an optional override | 8P01 |
 
-The four raw-material fields are only available when the checkbox is ticked.
+The four raw-material fields are only available when the reservation kind includes components (`R` or `A`).
 
 **Collective orders / exclusions**
 
 | Field | Meaning |
 |---|---|
-| Collective orders: leading / lowest level | Applies the collective-order rules of section 1.5 |
+| Collective orders: leading / lowest level | Applies the collective-order rules of section 1.5. Ticked by default |
 | Apply exclusion list | Applies the stored exclusion list (section 2.5) |
 | Exclusion spreadsheet (.xlsx) | File on your PC with a new exclusion list (only when the previous box is ticked) |
 
 ### 2.3 Running it
 
 1. Start transaction **`ZPTP_301_RES`**.
-2. Fill in the selection. For a first run, leave **Test run** ticked.
+2. Fill in the selection. For a first run, select **1 Test**.
 3. Execute (F8).
 4. Check the result list (section 2.4).
-5. If the result is as expected, go back (F3), **untick Test run**, and execute again.
+5. If the result is as expected, go back (F3), choose **3 Background** (or **2 Online**), and execute again.
+
+**Online mode in detail**
+1. Choose **2 Online** (default) and execute. The list opens with the simulated result (status *Simulated*).
+2. Tick the checkbox **Create** on a line of every production order you want to create. One tick is enough for the whole order: the finished-product line and the raw-material lines of that order are all created together. You can tick several orders.
+3. Press **Create reservations** in the toolbar.
+4. The lines of the ticked orders are replaced by the real result (*Created*, *Realigned*, *Closed* or *Error*). The other orders stay as *Simulated*.
+5. You can tick more orders and press the button again, as often as you like. Leave the list with Back (F3) when you are done.
+
+Orders you do not tick are never created in this mode.
 
 ### 2.4 Reading the result list
 
@@ -197,12 +213,30 @@ One line per reservation item. The most important columns:
 | Unchanged | The reservation was already correct |
 | Complete | The reservation is fully transferred |
 | Skipped | Nothing to do (for example *Fully received*), or the order was excluded by a rule (the message gives the reason) |
-| Simulated | Test run: this is what **would** happen |
+| Simulated | Test mode, or online mode before you create: this is what **would** happen |
 | Error | Something failed; read the message |
 
 Every run is also stored in the run log with the counters (created, realigned, closed, unchanged, skipped, errors).
 
+**Layout of the list**
+- The lines are **grouped by production order** first, then by item, then by kind (`H` finished product, `R` raw material). The *Kind* column is next to *Item*.
+- The material column is followed by the material **description** and the **material type**, then the **batch of the production order** (finished product: the batch of the order; raw material: the batch of the component line). The same batch is put on the new reservation, and the transfer report proposes it, then **Ext. to target plant**: ticked when the material is extended to the target plant (plant data exist there). If it is empty, the reservation cannot be created and the material has to be extended to the plant first (the program only extends the storage location, not the plant).
+- The column **Coll.Order Lead** is ticked only for the leading order of a collective order.
+- The column **Lead coll. order** shows the leading order of the collective order the production order belongs to (empty if it is not part of a collective order).
+- Lines are coloured by status: **green** for *Created*, *Complete* and *Unchanged*, **dark grey** for *Closed*, **yellow** for *Realigned*. The ALV has a fixed colour palette, so the text keeps its default colour.
+- Lines with status **E** (error) are shown in **red text on a white background**.
+- The **lowest-level order** of a **collective order** has a **light-grey background**.
+- The other orders of a collective order (not the lowest level) are shown in **grey font**.
+
 To check a reservation afterwards, use **MB23** (display reservation). **MB25** lists reservations, and the production order number is in the *goods recipient* field.
+
+### 2.4a Material not yet in the target storage location
+
+A reservation can only be created if the material exists in the **target storage location**. If it does not, and **Extend material to target storage location** is ticked, the program extends the material for you: it creates the storage location data in the target plant, copying the data of the source storage location (storage bin, MRP indicator, special procurement type, reorder point, replenishment quantity, inventory correction factor). The line then shows the message *material extended to target SLoc*. In a test run the status says *material will be extended to target SLoc*.
+
+The program cannot extend the material if it does not exist in the **target plant** at all, or if the target storage location does not exist in the plant. In that case the line shows *Create error* with the reason, and the key user has to extend the material to the plant (MM01/MM02).
+
+This changes the material master, so only leave the option ticked if this is wanted. With the option off, the reservation is not created and the BAPI's own error message is shown.
 
 ### 2.5 Using the exclusion list
 
@@ -226,21 +260,11 @@ Excluded orders appear in the result with status **Skipped** and the message *Or
 
 ### 2.6 Running it automatically
 
-You can have the generator repeat itself.
-
-1. Tick **Self-reschedule**.
-2. Enter the frequency and the unit (minutes, hours or days). The minimum is 1 minute and the maximum 30 days.
-3. Start the program.
-
-After each run, the program schedules the next one with the same settings. A run in test mode keeps repeating in test mode.
-
-**To stop it:** ask the key user to clear the **Active** flag of the plant pair (section 4) and to delete the waiting job `ZPTP_301_RES_CHAIN` in **SM37**.
-
-**Take care:** do not start it twice, or two chains will run in parallel. And do not tick *Self-reschedule* for a one-off manual run.
+The program does not reschedule itself. To run it regularly, schedule it as a recurring background job (SM36, with a variant using **3 Background**).
 
 ### 2.7 Collective orders
 
-Tick **Collective orders: leading / lowest level**. In the result, orders that do not qualify show status **Skipped** with the message *Collective order: not the leading order* (finished product) or *not the lowest-level order* (raw materials).
+**Collective orders: leading / lowest level** is ticked by default. With it ticked, orders that do not qualify show status **Skipped** with the message *Collective order: not the leading order* (finished product) or *not the lowest-level order* (raw materials).
 
 ---
 
@@ -338,7 +362,7 @@ Use transaction **SM30** for these tables.
 
 | Table | What to maintain |
 |---|---|
-| `ZPTP_301_CTRL` | One row for the plant pair 8P01 → 8Q01, with **Active** ticked. It enables the valuation-type logic for the finished-product transfer and switches the scheduled generator chain on. Clear *Active* to stop the chain. |
+| `ZPTP_301_CTRL` | One row for the plant pair 8P01 → 8Q01, with **Active** ticked. It enables the valuation-type logic for the finished-product transfer. |
 | `ZPTP_301_LGORT` | The **target storage location** of the reservations. Key: direction (`H` finished product, `R` raw material), issuing plant, receiving plant, **source storage location** (blank = any) and material type (blank = all). The most specific row wins: first the row for the source storage location, then the row for the material type. Both storage locations must exist in their plant. Components of one order that need different target storage locations end up in separate reservations. Changing the table does not change reservations that already exist. |
 | `ZPTP_301_VALTYPE` | The destination **valuation type** per destination plant, material type and fiscal year. A blank plant or material type means "all". Add the rows for the next fiscal year **before the year starts**, or transfers dated in the new year are refused. Keep a blank-material-type row as a fallback for each year. |
 
@@ -349,8 +373,8 @@ The exclusion list is stored in the table `ZPTP_301_EXCL`; it is filled through 
 ## 5. Quick reference
 
 ### Daily routine
-1. `ZPTP_301_RES`, **Test run** ticked. Check the result.
-2. `ZPTP_301_RES`, **Test run** unticked. Reservations are up to date.
+1. `ZPTP_301_RES`, mode **1 Test**. Check the result.
+2. `ZPTP_301_RES`, mode **3 Background** (all) or **2 Online** (selected orders). Reservations are up to date.
 3. `ZPTP_301_TRF`. Select the items you move today, confirm quantities, **Post transfer**.
 
 ### Where to check things
@@ -361,7 +385,7 @@ The exclusion list is stored in the table `ZPTP_301_EXCL`; it is filled through 
 | A transfer material document | **MB03** |
 | Cancel a transfer | **MBST** |
 | Close a reservation by hand | **MB22** |
-| Scheduled generator jobs | **SM37**, job `ZPTP_301_RES_CHAIN` |
+| Scheduled generator jobs | **SM37**, the job you scheduled for the generator |
 
 ### Common questions
 
