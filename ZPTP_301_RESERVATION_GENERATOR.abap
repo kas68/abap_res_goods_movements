@@ -971,14 +971,14 @@ CLASS lcl_app IMPLEMENTATION.
     ENDSELECT.
 
     " Fallback when the log row is missing: the order number is stored as
-    " goods recipient (RESB-WEMPF) at creation. MATNR/WERKS/XLOEK/KZEAR
-    " match RESB secondary index M.
+    " goods recipient (RESB-WEMPF) at creation. MATNR/WERKS/XLOEK match RESB
+    " secondary index M. Deleted items are ignored (as if never created);
+    " closed items (final issue) are found so that nothing is done for them.
     IF lv_link_rsnum IS INITIAL.
       SELECT rsnum, rspos FROM resb ##NULL_VALUES
         WHERE matnr = @iv_matnr
           AND werks = @iv_werks_fr
           AND xloek = @space
-          AND kzear = @space
           AND wempf = @iv_aufnr
           AND umwrk = @iv_werks_to
           AND bwart = @gc_mvt_301
@@ -988,11 +988,16 @@ CLASS lcl_app IMPLEMENTATION.
       ENDSELECT.
     ENDIF.
 
-    DATA lv_has_res TYPE abap_bool.
+    DATA: lv_has_res TYPE abap_bool,
+          lv_closed  TYPE abap_bool.
     IF lv_link_rsnum IS NOT INITIAL.
-      SELECT SINGLE bdmng, enmng FROM resb INTO @DATA(ls_resb)
+      SELECT SINGLE bdmng, enmng, xloek, kzear FROM resb INTO @DATA(ls_resb)
         WHERE rsnum = @lv_link_rsnum AND rspos = @lv_link_rspos.
-      IF sy-subrc = 0.
+      " A deleted item counts as never created (a new reservation is made for
+      " the open quantity) and is never changed; a closed item (final issue)
+      " counts as completed.
+      IF sy-subrc = 0 AND ls_resb-xloek = abap_false.
+        lv_closed        = ls_resb-kzear.
         lv_has_res       = abap_true.
         ls_out-rsnum     = lv_link_rsnum.
         ls_out-rspos     = lv_link_rspos.
@@ -1039,7 +1044,12 @@ CLASS lcl_app IMPLEMENTATION.
         ls_out = lt_one[ 1 ].
       ENDIF.
     ELSE.
-      IF iv_to_close = abap_true OR iv_basis <= 0.
+      IF lv_closed = abap_true.
+        " closed reservation item (final issue): completed, nothing to do
+        ls_out-status  = gc_complete.
+        ls_out-statxt  = 'Complete'.
+        ls_out-message = 'Reservation item is closed (final issue)'.
+      ELSEIF iv_to_close = abap_true OR iv_basis <= 0.
         IF ls_out-res_bdmng = ls_out-res_enmng.
           ls_out-status = gc_complete.
           ls_out-statxt = 'Complete'.

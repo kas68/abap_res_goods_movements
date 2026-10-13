@@ -216,6 +216,8 @@ One line per reservation item. The most important columns:
 | Simulated | Test mode, or online mode before you create: this is what **would** happen |
 | Error | Something failed; read the message |
 
+Deleted and closed reservation items: an item deleted in SAP is treated as if it had never been created, so the generator creates a new reservation for the open quantity and never changes the deleted item. A closed item (final issue) is shown as *Complete* and left alone.
+
 Every run is also stored in the run log with the counters (created, realigned, closed, unchanged, skipped, errors).
 
 **Layout of the list**

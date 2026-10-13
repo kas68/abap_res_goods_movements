@@ -80,6 +80,8 @@ Before a reservation is created (not in simulations), the generator checks for e
 | Yes | > 0, different from reservation | Realign (`BDMNG = basis + ENMNG`) |
 | Yes | > 0, equal | Unchanged |
 
+A reservation item with the **deletion indicator** (`RESB-XLOEK`) counts as *No* (never created): a new reservation is created for the open basis quantity and the deleted item is never changed. An item that is **closed** (final issue, `RESB-KZEAR`) counts as completed: status *Complete*, nothing is done.
+
 ### Collective orders — option `P_COLL`
 - Finished product (8P01 → 8Q01): only for the **leading** order.
 - Components (8Q01 → 8P01): only for the **lowest-level** order.
@@ -96,6 +98,16 @@ Shown in the ALV and the detail log with status *Skipped* and the reason. Reserv
 
 ### Scheduling
 The program does not reschedule itself; schedule it as a (recurring) background job in SM36 with a variant using **3 Background**.
+
+## Reservation manager — `ZPTP_301_RESERVATION_MANAGER` (txn `ZPTP_301_MGR`)
+Deletes reservation items created by the generator, with reversal of the 301 postings if any.
+- Reads `ZPTP_301_RES_LOG`: the latest reservation item per order / kind / item (`RSNUM <> blank`), then `RESB` (items with `XLOEK` set are not listed).
+- ALV per item: state (*Open* / *Closed*: `KZEAR` or `BDMNG <= ENMNG`), *Followed by 301* (successful row in `ZPTP_301_TRF_LOG` whose material document is not reversed yet; reversal documents are recognised through `MSEG-SMBLN`/`SJAHR`), reservation quantity `BDMNG`, withdrawn `ENMNG`, quantity of the 301 movement(s), last material document, and the action `POST` will take.
+- `POST` (function of GUI status `ZMANAGER`) on the ticked items, after a confirmation popup:
+  - not followed by a movement: `BAPI_RESERVATION_CHANGE` with `DELETE_IND = X`;
+  - followed by a movement: `BAPI_GOODSMVT_CANCEL` for every material document of the item (posting date `P_BUDAT`), logged in `ZPTP_301_TRF_LOG` with `STATUS = R`; only if all reversals succeed, the item is deleted. If the deletion fails after the reversals, the line is yellow and says so.
+- Selection: `SO_RSNUM`, `SO_AUFNR`, `SO_MATNR`, `SO_ERDAT` (date of the log entry), `P_BUDAT` (posting date of the reversals).
+- Text symbols: 001 *Reservation selection*, 002 *Reversal*. Selection texts: `SO_RSNUM` Reservation, `SO_AUFNR` Production order, `SO_MATNR` Material, `SO_ERDAT` Log date, `P_BUDAT` Posting date of the reversals. GUI status `ZMANAGER` (SE41, copy of `STANDARD_FULLSCREEN` of `SAPLKKBL`, add `POST`, text *Delete / reverse*, icon `ICON_DELETE`).
 
 ## Transfer report
 
