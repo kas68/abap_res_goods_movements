@@ -3,9 +3,9 @@
 *&---------------------------------------------------------------------*
 *& Manual 301 transfer against reservations.
 *&
-*& Lists the OPEN 301 reservation items between two plants (default
-*& 8P01 -> 8Q01 = finished products; run with 8Q01 -> 8P01 for the raw
-*& material reservations) with material, open reservation quantity and
+*& Lists the OPEN 301 reservation items of up to two plant combinations
+*& (default: 1 = 8P01 -> 8Q01 finished products, 2 = 8Q01 -> 8P01 raw
+*& materials; each combination can be switched off) with material, open reservation quantity and
 *& the available UNRESTRICTED stock in the source plant / storage location.
 *&
 *& The user selects the reservation items and presses POST: one 301 goods
@@ -30,9 +30,29 @@ DATA: gv_aufnr TYPE aufnr,
       gv_matnr TYPE matnr,
       gv_rsnum TYPE rsnum.
 
-SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.   " Plants
-PARAMETERS: p_werkfr TYPE werks_d OBLIGATORY DEFAULT '8P01',   " source plant (issuing)
-            p_werkto TYPE werks_d OBLIGATORY DEFAULT '8Q01'.   " destination plant (receiving)
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.   " Plants: up to 2 combinations
+" combination 1 : finished products 8P01 -> 8Q01
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(13) TEXT-c01 FOR FIELD p_act1.      " Combination 1
+PARAMETERS p_act1 AS CHECKBOX DEFAULT 'X'.                     " active
+SELECTION-SCREEN COMMENT 18(10) TEXT-c03 FOR FIELD p_wfr1.     " From plant
+SELECTION-SCREEN POSITION 29.
+PARAMETERS p_wfr1 TYPE werks_d DEFAULT '8P01'.                 " source plant (issuing)
+SELECTION-SCREEN COMMENT 36(8) TEXT-c04 FOR FIELD p_wto1.      " To plant
+SELECTION-SCREEN POSITION 45.
+PARAMETERS p_wto1 TYPE werks_d DEFAULT '8Q01'.                 " destination plant (receiving)
+SELECTION-SCREEN END OF LINE.
+" combination 2 : raw materials 8Q01 -> 8P01
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(13) TEXT-c02 FOR FIELD p_act2.      " Combination 2
+PARAMETERS p_act2 AS CHECKBOX DEFAULT 'X'.                     " active
+SELECTION-SCREEN COMMENT 18(10) TEXT-c03 FOR FIELD p_wfr2.     " From plant
+SELECTION-SCREEN POSITION 29.
+PARAMETERS p_wfr2 TYPE werks_d DEFAULT '8Q01'.                 " source plant (issuing)
+SELECTION-SCREEN COMMENT 36(8) TEXT-c04 FOR FIELD p_wto2.      " To plant
+SELECTION-SCREEN POSITION 45.
+PARAMETERS p_wto2 TYPE werks_d DEFAULT '8P01'.                 " destination plant (receiving)
+SELECTION-SCREEN END OF LINE.
 SELECTION-SCREEN END OF BLOCK b1.
 
 SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.   " Reservation selection
@@ -76,10 +96,17 @@ CLASS lcl_app DEFINITION FINAL.
              menge    TYPE menge_d,               " quantity to post (editable)
              meins    TYPE meins,
              charg    TYPE charg_d,               " batch (editable)
+             close    TYPE abap_bool,             " X = close the reservation item with this posting (editable)
              mblnr    TYPE mblnr,
              message  TYPE string,
            END OF ty_out.
     TYPES tt_out TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY.
+    TYPES: BEGIN OF ty_combo,
+             active   TYPE abap_bool,
+             werks_fr TYPE werks_d,
+             werks_to TYPE werks_d,
+           END OF ty_combo.
+    TYPES tt_combo TYPE STANDARD TABLE OF ty_combo WITH DEFAULT KEY.
 
     METHODS constructor.
     METHODS run.
@@ -90,6 +117,7 @@ CLASS lcl_app DEFINITION FINAL.
     DATA: mt_out    TYPE tt_out,
           mv_run_id TYPE sysuuid_c32.
 
+    METHODS check_plants.
     METHODS select_data.
     METHODS read_stock
       IMPORTING iv_matnr        TYPE matnr
@@ -119,9 +147,7 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD run.
-    IF p_werkfr = p_werkto.
-      MESSAGE e027(zptp_split_val) WITH p_werkfr p_werkto.
-    ENDIF.
+    check_plants( ).
     select_data( ).
     IF mt_out IS INITIAL.
       MESSAGE s052(zptp_split_val).                    " no open 301 reservations found
@@ -131,23 +157,70 @@ CLASS lcl_app IMPLEMENTATION.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
+  METHOD check_plants.
+    " At least one combination must be active; an active combination needs
+    " two different, existing plants; the two combinations must differ.
+    IF p_act1 = abap_false AND p_act2 = abap_false.
+      MESSAGE 'Activate at least one plant combination' TYPE 'E'.
+    ENDIF.
+
+    DATA(lt_combo) = VALUE tt_combo(
+      ( active = p_act1 werks_fr = p_wfr1 werks_to = p_wto1 )
+      ( active = p_act2 werks_fr = p_wfr2 werks_to = p_wto2 ) ).
+
+    LOOP AT lt_combo ASSIGNING FIELD-SYMBOL(<c>) WHERE active = abap_true.
+      IF <c>-werks_fr IS INITIAL OR <c>-werks_to IS INITIAL.
+        MESSAGE 'Enter the source and destination plant of the active combination' TYPE 'E'.
+      ENDIF.
+      IF <c>-werks_fr = <c>-werks_to.
+        MESSAGE e027(zptp_split_val) WITH <c>-werks_fr <c>-werks_to.
+      ENDIF.
+      SELECT SINGLE werks FROM t001w INTO @DATA(lv_w) WHERE werks = @<c>-werks_fr.
+      IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH <c>-werks_fr. ENDIF.
+      SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @<c>-werks_to.
+      IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH <c>-werks_to. ENDIF.
+    ENDLOOP.
+
+    IF p_act1 = abap_true AND p_act2 = abap_true
+       AND p_wfr1 = p_wfr2 AND p_wto1 = p_wto2.
+      MESSAGE 'The two plant combinations are identical' TYPE 'E'.
+    ENDIF.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
   METHOD select_data.
-    " Open 301 reservation items from the source plant to the destination
-    " plant. XWAOK = movement allowed; deleted / final-issued excluded.
-    SELECT rsnum, rspos, matnr, werks, lgort, umwrk, umlgo,
-           bdmng, enmng, meins, bdter, wempf, charg
-      FROM resb
-      INTO TABLE @DATA(lt_resb)
-      WHERE bwart  = @gc_mvt_301
-        AND werks  = @p_werkfr
-        AND umwrk  = @p_werkto
-        AND rsnum IN @so_rsnum
-        AND matnr IN @so_matnr
-        AND wempf IN @so_aufnr
-        AND bdter IN @so_bdter
-        AND xloek  = @space
-        AND kzear  = @space
-        AND xwaok  = @abap_true.
+    " Open 301 reservation items of every active plant combination (source
+    " plant -> destination plant). XWAOK = movement allowed; deleted /
+    " final-issued excluded.
+    TYPES: BEGIN OF ty_resb,
+             rsnum TYPE rsnum, rspos TYPE rspos, matnr TYPE matnr,
+             werks TYPE werks_d, lgort TYPE lgort_d,
+             umwrk TYPE umwrk, umlgo TYPE umlgo,
+             bdmng TYPE bdmng, enmng TYPE enmng, meins TYPE meins,
+             bdter TYPE bdter, wempf TYPE wempf, charg TYPE charg_d,
+           END OF ty_resb.
+    DATA lt_resb TYPE STANDARD TABLE OF ty_resb WITH DEFAULT KEY.
+
+    DATA(lt_combo) = VALUE tt_combo(
+      ( active = p_act1 werks_fr = p_wfr1 werks_to = p_wto1 )
+      ( active = p_act2 werks_fr = p_wfr2 werks_to = p_wto2 ) ).
+
+    LOOP AT lt_combo ASSIGNING FIELD-SYMBOL(<c>) WHERE active = abap_true.
+      SELECT rsnum, rspos, matnr, werks, lgort, umwrk, umlgo,
+             bdmng, enmng, meins, bdter, wempf, charg
+        FROM resb
+        APPENDING CORRESPONDING FIELDS OF TABLE @lt_resb
+        WHERE bwart  = @gc_mvt_301
+          AND werks  = @<c>-werks_fr
+          AND umwrk  = @<c>-werks_to
+          AND rsnum IN @so_rsnum
+          AND matnr IN @so_matnr
+          AND wempf IN @so_aufnr
+          AND bdter IN @so_bdter
+          AND xloek  = @space
+          AND kzear  = @space
+          AND xwaok  = @abap_true.
+    ENDLOOP.
     IF lt_resb IS INITIAL.
       RETURN.
     ENDIF.
@@ -262,6 +335,7 @@ CLASS lcl_app IMPLEMENTATION.
           iv_charg   = <o>-charg
           iv_budat   = p_budat
           iv_run_id  = mv_run_id
+          iv_close   = <o>-close
         IMPORTING
           ev_status  = lv_status
           ev_message = lv_msg
@@ -272,7 +346,13 @@ CLASS lcl_app IMPLEMENTATION.
         <o>-icon  = icon_led_green.
         <o>-mblnr = lv_mblnr.
         <o>-sel   = abap_false.
-        refresh_row( CHANGING cs_out = <o> ).          " new open qty / stock / default qty
+        DATA(lv_closed) = <o>-close.
+        <o>-close = abap_false.
+        refresh_row( CHANGING cs_out = <o> ).           " new open qty / stock / default qty
+        IF lv_closed = abap_true.                      " item closed: nothing left to post
+          <o>-res_open = 0.
+          <o>-menge    = 0.
+        ENDIF.
       ELSE.
         <o>-icon = icon_led_red.
       ENDIF.
@@ -327,6 +407,7 @@ CLASS lcl_app IMPLEMENTATION.
     _col 'MENGE'    'Qty to post'      13.
     _col 'MEINS'    'UoM'              3.
     _col 'CHARG'    'Batch'            10.
+    _col 'CLOSE'    'Close res.'       6.
     _col 'MBLNR'    'Mat. doc'         10.
     _col 'MESSAGE'  'Message'          60.
 
@@ -335,14 +416,21 @@ CLASS lcl_app IMPLEMENTATION.
         WHEN 'ICON'.
           <f>-icon = abap_true.
         WHEN 'MENGE'.
+          " No QFIELDNAME on the quantity columns: with a unit such as MG (0 decimals
+          " in T006) the grid would format and read the value with the unit's decimals
+          " although the fields have 3 (MENGE_D), and a typed 1250 came back as 1.250.
           <f>-edit        = abap_true.
-          <f>-qfieldname  = 'MEINS'.
+          <f>-decimals_o  = 3.
           <f>-emphasize   = 'C310'.                    " highlighted: editable
         WHEN 'CHARG'.
           <f>-edit        = abap_true.
           <f>-emphasize   = 'C310'.
+        WHEN 'CLOSE'.
+          <f>-checkbox    = abap_true.
+          <f>-edit        = abap_true.
+          <f>-emphasize   = 'C310'.
         WHEN 'BDMNG' OR 'ENMNG' OR 'RES_OPEN' OR 'AVAIL'.
-          <f>-qfieldname  = 'MEINS'.
+          <f>-decimals_o  = 3.
         WHEN 'MATNR'.
           <f>-ref_table = 'MARA'. <f>-ref_field = 'MATNR'.
         WHEN 'MEINS'.                                  " unit shown in the logon language

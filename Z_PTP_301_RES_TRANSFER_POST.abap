@@ -17,6 +17,8 @@
 *&   IV_CHARG   TYPE charg_d   Batch (optional; falls back to RESB-CHARG)
 *&   IV_BUDAT   TYPE budat     Posting date
 *&   IV_RUN_ID  TYPE sysuuid_c32 (optional) run id for the log
+*&   IV_CLOSE   TYPE abap_bool  (optional) X = final issue: the reservation item is
+*&                             closed with this posting even if quantity is still open
 *& EXPORT parameters:
 *&   EV_STATUS  TYPE char1     S = posted / E = error
 *&   EV_MESSAGE TYPE string
@@ -33,6 +35,7 @@ FUNCTION z_ptp_301_res_transfer_post.
 *"     VALUE(IV_CHARG) TYPE CHARG_D OPTIONAL
 *"     VALUE(IV_BUDAT) TYPE BUDAT DEFAULT SY-DATUM
 *"     VALUE(IV_RUN_ID) TYPE SYSUUID_C32 OPTIONAL
+*"     VALUE(IV_CLOSE) TYPE ABAP_BOOL OPTIONAL
 *"  EXPORTING
 *"     VALUE(EV_STATUS) TYPE CHAR1
 *"     VALUE(EV_MESSAGE) TYPE STRING
@@ -289,10 +292,13 @@ FUNCTION z_ptp_301_res_transfer_post.
   ls_item-move_val_type = lv_valtype.
   ls_item-reserv_no     = iv_rsnum.                  " reservation reference (consumes ENMNG)
   ls_item-res_item      = iv_rspos.
-  ls_item-res_type      = 'R'.
+  " RES_TYPE stays blank: the reservation items have RESB-RSART blank (manual reservation, BDART MR)
+  IF iv_close = abap_true.
+    ls_item-withdrawn = abap_true.                 " final issue (RESB-KZEAR): closes the item
+  ENDIF.
   APPEND ls_item TO lt_item.
 
-  CALL FUNCTION 'BAPI_GOODS_MOVEMENT_CREATE'
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
     EXPORTING
       goodsmvt_header  = ls_head
       goodsmvt_code    = ls_code
@@ -305,7 +311,15 @@ FUNCTION z_ptp_301_res_transfer_post.
 
   IF line_exists( lt_ret[ type = 'E' ] ) OR line_exists( lt_ret[ type = 'A' ] ).
     CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
-    ev_status = 'E'. ev_message = |{ VALUE #( lt_ret[ type = 'E' ]-message DEFAULT `Posting error` ) }|. _finish.
+    " first error message with its message class / number (for the analysis in SE91)
+    DATA(ls_err) = VALUE bapiret2( lt_ret[ type = 'E' ] OPTIONAL ).
+    IF ls_err IS INITIAL.
+      ls_err = VALUE bapiret2( lt_ret[ type = 'A' ] OPTIONAL ).
+    ENDIF.
+    ev_status  = 'E'.
+    ev_message = COND #( WHEN ls_err IS INITIAL THEN `Posting error`
+                         ELSE |{ ls_err-message } ({ ls_err-id } { ls_err-number })| ).
+    _finish.
   ENDIF.
 
   CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = 'X'.
@@ -313,6 +327,8 @@ FUNCTION z_ptp_301_res_transfer_post.
   ev_mjahr         = lv_matyr.
   ls_log-mov_mblnr = lv_matdoc.
   ls_log-mov_mjahr = lv_matyr.
-  ev_status = 'S'. ev_message = |301 doc { lv_matdoc } posted, qty { iv_menge } { ls_resb-meins }{ lv_batch_note }|. _finish.
+  ev_status = 'S'. ev_message = |301 doc { lv_matdoc } posted, qty { iv_menge } { ls_resb-meins }{ lv_batch_note }|
+                          && COND string( WHEN iv_close = abap_true THEN ', reservation closed (final issue)' ).
+  _finish.
 
 ENDFUNCTION.

@@ -279,8 +279,8 @@ The program does not reschedule itself. To run it regularly, schedule it as a re
 
 | Field | Meaning | Default |
 |---|---|---|
-| Source plant (issuing) | Plant the goods leave | 8P01 |
-| Destination plant (receiving) | Plant the goods go to | 8Q01 |
+| Combination 1: Active, From plant, To plant | Plant the goods leave and plant they go to (finished products) | Active, 8P01 → 8Q01 |
+| Combination 2: Active, From plant, To plant | A second pair (raw materials) | Active, 8Q01 → 8P01 |
 | Reservation | Limit to some reservations | — |
 | Production order | Limit to some orders | — |
 | Material | Limit to some materials | — |
@@ -306,6 +306,7 @@ One line per open reservation item. The status light is empty until you post.
 | **Open res. qty** | What is still to be transferred |
 | **Unrestr. stock** | Unrestricted stock available in the source |
 | **Qty to post** (highlighted, editable) | Quantity the report will post. **Default = open reservation quantity** |
+| **Close res.** (checkbox, editable) | Tick it to close the reservation item with this posting, even if quantity is still open (final issue). The remaining open quantity is no longer proposed. |
 | UoM | Unit of measure |
 | **Batch** (highlighted, editable) | Batch to transfer, for batch-managed materials |
 | Mat. doc | The 301 material document, after a successful posting |

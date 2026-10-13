@@ -101,7 +101,7 @@ The program does not reschedule itself; schedule it as a (recurring) background 
 
 - Lists open 301 reservation items (`RESB`: `BWART = 301`, `WERKS` = source plant, `UMWRK` = destination plant, not deleted / final-issued, `XWAOK = X`, `BDMNG > ENMNG`) with material, open quantity (`BDMNG − ENMNG`) and the **unrestricted** stock in the source (`MARD-LABST`, or `MCHB-CLABS` if the item has a batch). Quality-inspection and blocked stock are not counted.
 - Run it with 8P01 → 8Q01 for finished products and with 8Q01 → 8P01 for raw-material reservations.
-- Select items, adjust *Qty to post* (default = open reservation quantity) and the batch if needed, press **Post transfer** (function `POST`).
+- Select items, adjust *Qty to post* (default = open reservation quantity) and the batch if needed, tick *Close res.* to close the item with the posting (final issue, `IV_CLOSE` → `WITHDRAWN = X`), press **Post transfer** (function `POST`).
 - The quantity must be > 0, ≤ the open reservation quantity and ≤ the unrestricted stock. Partial transfers are allowed; the item stays open for the rest.
 - One call of `Z_PTP_301_RES_TRANSFER_POST` per item = one posting = one commit. A failing item never blocks the others. Results show in the *Message* column and in `ZPTP_301_TRF_LOG`.
 - A 301 is cancelled manually with MBST; cancelling restores `ENMNG` and the reservation reopens.
@@ -115,7 +115,7 @@ The program does not reschedule itself; schedule it as a (recurring) background 
    - *Forward* (8P01 → 8Q01; an active `ZPTP_301_CTRL` entry exists for the plant pair): the destination valuation type is read from `ZPTP_301_VALTYPE` for the destination plant, the material type (`MARA-MTART`) and the fiscal year of the posting date (company code from the source plant via `T001W` → `T001K`, `FI_PERIOD_DETERMINE`). The most specific entry wins: plant-specific over blank plant, then material-type-specific over blank material type. The source valuation type stays blank (8P01 is not split-valuated). No entry → error, nothing posted.
    - *Reverse* (8Q01 → 8P01): no mapping; the source valuation type is read from the source batch (`MCHA-BWTAR`).
 5. Creates the batch in the destination plant from the source batch when it does not exist (`BAPI_BATCH_GET_DETAIL`, `BAPI_BATCH_CREATE`); the new batch is committed with the 301.
-6. Posts the 301 with `BAPI_GOODS_MOVEMENT_CREATE` (`GM_CODE 04`) referencing the reservation (`RESERV_NO`, `RES_ITEM`, `RES_TYPE = R`), commits, and writes `ZPTP_301_TRF_LOG`.
+6. Posts the 301 with `BAPI_GOODSMVT_CREATE` (`GM_CODE 04`) referencing the reservation (`RESERV_NO`, `RES_ITEM`, `RES_TYPE` blank), commits, and writes `ZPTP_301_TRF_LOG`.
 
 ## DDIC objects
 
@@ -222,8 +222,8 @@ Text symbols: 001 *Plants and storage locations*, 002 *Order selection*, 003 *Ru
 Selection texts: `P_WERKFR` Origin plant, `P_LGORFR` Origin storage location (override of the order's storage location), `P_WERKTO` Destination plant, `P_LGORTO` Destination storage location (override), `SO_AUFNR` Production order, `SO_AUART` Order type, `SO_MATNR` Material, `SO_DISPO` MRP controller, `P_RSDAT` Reservation requirement date, `P_MOVE` Movement allowed, `R_TEST` 1 Test (simulation, nothing is created), `R_ONL` 2 Online (simulation, then create the ticked orders), `R_BACK` 3 Background (all reservations are created), `P_ERRON` Reprocess errors only, `P_EXTSL` Extend material to target storage location, `P_CLRLG` Clean all logs before the run, `P_KIND` Reservation kind (dropdown: H finished products / R components / A all), `P_WERKRF` RM issuing plant, `P_LGORRF` RM issuing storage location (override), `P_WERKRT` RM receiving plant, `P_LGORRT` RM receiving storage location (override), `P_COLL` Collective orders: leading / lowest level, `P_EXCL` Apply exclusion list, `P_FILE` Exclusion spreadsheet (.xlsx).
 
 ### Text elements — transfer report
-Text symbols: 001 *Plants*, 002 *Reservation selection*, 003 *Posting*.
-Selection texts: `P_WERKFR` Source plant (issuing), `P_WERKTO` Destination plant (receiving), `SO_RSNUM` Reservation, `SO_AUFNR` Production order, `SO_MATNR` Material, `SO_BDTER` Requirement date, `P_STOCK` Only items with unrestricted stock, `P_BUDAT` Posting date.
+Text symbols: 001 *Plants (up to 2 combinations)*, 002 *Reservation selection*, 003 *Posting*, C01 *Combination 1*, C02 *Combination 2*, C03 *From plant*, C04 *To plant*.
+Selection texts: `P_ACT1` / `P_ACT2` Active (combination 1 / 2), `P_WFR1` / `P_WFR2` Source plant (issuing), `P_WTO1` / `P_WTO2` Destination plant (receiving), `SO_RSNUM` Reservation, `SO_AUFNR` Production order, `SO_MATNR` Material, `SO_BDTER` Requirement date, `P_STOCK` Only items with unrestricted stock, `P_BUDAT` Posting date.
 
 ## Test
 
