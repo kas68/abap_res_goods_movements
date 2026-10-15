@@ -15,6 +15,8 @@
 *&   IV_RSPOS   TYPE rspos     Reservation item
 *&   IV_MENGE   TYPE menge_d   Quantity to transfer (base UoM of the item)
 *&   IV_CHARG   TYPE charg_d   Batch (optional; falls back to RESB-CHARG)
+*&   IV_LGORT   TYPE lgort_d   Source storage location as chosen by the user (the report
+*&                             passes the grid value; blank = whole plant)
 *&   IV_BUDAT   TYPE budat     Posting date
 *&   IV_RUN_ID  TYPE sysuuid_c32 (optional) run id for the log
 *&   IV_CLOSE   TYPE abap_bool  (optional) X = final issue: the reservation item is
@@ -33,6 +35,7 @@ FUNCTION z_ptp_301_res_transfer_post.
 *"     VALUE(IV_RSPOS) TYPE RSPOS
 *"     VALUE(IV_MENGE) TYPE MENGE_D
 *"     VALUE(IV_CHARG) TYPE CHARG_D OPTIONAL
+*"     VALUE(IV_LGORT) TYPE LGORT_D OPTIONAL
 *"     VALUE(IV_BUDAT) TYPE BUDAT DEFAULT SY-DATUM
 *"     VALUE(IV_RUN_ID) TYPE SYSUUID_C32 OPTIONAL
 *"     VALUE(IV_CLOSE) TYPE ABAP_BOOL OPTIONAL
@@ -98,10 +101,24 @@ FUNCTION z_ptp_301_res_transfer_post.
   DATA(lv_charg) = COND charg_d( WHEN iv_charg IS NOT INITIAL THEN iv_charg ELSE ls_resb-charg ).
   ls_log-charg = lv_charg.
 
+  " Source storage location as entered by the user in the report (it starts as the
+  " one of the reservation); blank = whole plant.
+  DATA(lv_lgort) = iv_lgort.
+  IF lv_lgort IS NOT INITIAL.
+    SELECT SINGLE lgort FROM t001l INTO @DATA(lv_sloc_ok)
+      WHERE werks = @ls_resb-werks AND lgort = @lv_lgort.
+    IF sy-subrc <> 0.
+      ev_status = 'E'. ev_message = |Storage location { lv_lgort } does not exist in plant { ls_resb-werks }|. _finish.
+    ENDIF.
+  ENDIF.
+
   SELECT SINGLE xchpf FROM marc INTO @DATA(lv_xchpf_src)
     WHERE matnr = @ls_resb-matnr AND werks = @ls_resb-werks.
   IF lv_xchpf_src = abap_true AND lv_charg IS INITIAL.
     ev_status = 'E'. ev_message = |Material { ls_resb-matnr } is batch-managed: enter a batch|. _finish.
+  ENDIF.
+  IF lv_xchpf_src = abap_false AND lv_charg IS NOT INITIAL.
+    ev_status = 'E'. ev_message = |Material { ls_resb-matnr } is not batch-managed in plant { ls_resb-werks }: remove the batch|. _finish.
   ENDIF.
 
 *--------------------------------------------------------------------*
@@ -110,8 +127,8 @@ FUNCTION z_ptp_301_res_transfer_post.
 *--------------------------------------------------------------------*
   DATA: lv_avail TYPE menge_d,
         lr_lgort TYPE RANGE OF lgort_d.
-  IF ls_resb-lgort IS NOT INITIAL.                    " blank storage location = whole plant
-    lr_lgort = VALUE #( ( sign = 'I' option = 'EQ' low = ls_resb-lgort ) ).
+  IF lv_lgort IS NOT INITIAL.                         " blank storage location = whole plant
+    lr_lgort = VALUE #( ( sign = 'I' option = 'EQ' low = lv_lgort ) ).
   ENDIF.
   IF lv_charg IS NOT INITIAL.
     SELECT SUM( clabs ) FROM mchb
@@ -126,7 +143,11 @@ FUNCTION z_ptp_301_res_transfer_post.
       INTO @lv_avail.
   ENDIF.
   IF iv_menge > lv_avail.
-    ev_status = 'E'. ev_message = |Quantity { iv_menge } exceeds unrestricted stock { lv_avail } in { ls_resb-werks }|. _finish.
+    ev_status = 'E'.
+    ev_message = |Quantity { iv_menge } exceeds unrestricted stock { lv_avail } in plant { ls_resb-werks }|
+              && COND string( WHEN lv_lgort IS NOT INITIAL THEN |, storage location { lv_lgort }| )
+              && COND string( WHEN lv_charg IS NOT INITIAL THEN |, batch { lv_charg }| ).
+    _finish.
   ENDIF.
 
 *--------------------------------------------------------------------*
@@ -280,7 +301,7 @@ FUNCTION z_ptp_301_res_transfer_post.
 
   ls_item-material_long = ls_resb-matnr.             " S/4: 40-char MATNR
   ls_item-plant         = ls_resb-werks.
-  ls_item-stge_loc      = ls_resb-lgort.
+  ls_item-stge_loc      = lv_lgort.                  " source storage location (user input)
   ls_item-move_type     = ls_resb-bwart.             " 301
   ls_item-entry_qnt     = iv_menge.
   ls_item-entry_uom     = ls_resb-meins.

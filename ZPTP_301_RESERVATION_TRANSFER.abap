@@ -305,7 +305,8 @@ CLASS lcl_app IMPLEMENTATION.
       lv_count = lv_count + 1.
       CLEAR: <o>-mblnr, <o>-message.
 
-      " quantity re-validated against current data (stock may have moved)
+      " quantity re-validated against current data and against the storage
+      " location and batch as entered in the grid (stock may have moved)
       IF <o>-menge <= 0.
         <o>-icon    = icon_led_red.
         <o>-message = 'Quantity must be greater than zero'.
@@ -323,7 +324,9 @@ CLASS lcl_app IMPLEMENTATION.
       <o>-avail = lv_avail.
       IF <o>-menge > lv_avail.
         <o>-icon    = icon_led_red.
-        <o>-message = |Quantity exceeds unrestricted stock { lv_avail }|.
+        <o>-message = |Quantity exceeds unrestricted stock { lv_avail } in plant { <o>-werks_fr }|
+                   && COND string( WHEN <o>-lgort_fr IS NOT INITIAL THEN |, storage location { <o>-lgort_fr }| )
+                   && COND string( WHEN <o>-charg IS NOT INITIAL THEN |, batch { <o>-charg }| ).
         CONTINUE.
       ENDIF.
 
@@ -333,6 +336,7 @@ CLASS lcl_app IMPLEMENTATION.
           iv_rspos   = <o>-rspos
           iv_menge   = <o>-menge
           iv_charg   = <o>-charg
+          iv_lgort   = <o>-lgort_fr                     " source storage location as entered
           iv_budat   = p_budat
           iv_run_id  = mv_run_id
           iv_close   = <o>-close
@@ -422,7 +426,7 @@ CLASS lcl_app IMPLEMENTATION.
           <f>-edit        = abap_true.
           <f>-decimals_o  = 3.
           <f>-emphasize   = 'C310'.                    " highlighted: editable
-        WHEN 'CHARG'.
+        WHEN 'CHARG' OR 'LGORT_FR'.                    " batch and source storage location: editable
           <f>-edit        = abap_true.
           <f>-emphasize   = 'C310'.
         WHEN 'CLOSE'.

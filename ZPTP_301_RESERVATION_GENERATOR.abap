@@ -53,9 +53,7 @@ PARAMETERS: r_test RADIOBUTTON GROUP mod,                      " 1 test: simulat
 SELECTION-SCREEN END OF BLOCK b3a.
 SELECTION-SCREEN BEGIN OF BLOCK b3b WITH FRAME TITLE TEXT-008. " Options
 PARAMETERS: p_move  AS CHECKBOX DEFAULT 'X',                   " movement-relevant
-            p_erron AS CHECKBOX,                               " reprocess errors only
-            p_extsl AS CHECKBOX DEFAULT 'X',                   " extend material to the target storage location
-            p_clrlg AS CHECKBOX.                               " clean all logs (run log + item log) before the run
+            p_extsl AS CHECKBOX DEFAULT 'X'.                   " extend material to the target storage location
 SELECTION-SCREEN END OF BLOCK b3b.
 SELECTION-SCREEN END OF BLOCK b3.
 
@@ -80,18 +78,14 @@ SELECTION-SCREEN END OF BLOCK b2.
 
 SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001. " Plants / locations
 PARAMETERS: p_werkfr TYPE werks_d OBLIGATORY DEFAULT '8P01', " origin plant
-            p_lgorfr TYPE lgort_d,                            " origin stor.loc
-            p_werkto TYPE werks_d OBLIGATORY DEFAULT '8Q01', " destination plant
-            p_lgorto TYPE lgort_d.                            " destination stor.loc
+            p_werkto TYPE werks_d OBLIGATORY DEFAULT '8Q01'. " destination plant
 SELECTION-SCREEN END OF BLOCK b1.
 
 SELECTION-SCREEN BEGIN OF BLOCK b5 WITH FRAME TITLE TEXT-005. " Raw materials
 PARAMETERS: p_werkrf TYPE werks_d DEFAULT '8Q01'              " RM source plant (new plant)
                      MODIF ID raw,
-            p_lgorrf TYPE lgort_d MODIF ID raw,               " RM source stor.loc
             p_werkrt TYPE werks_d DEFAULT '8P01'              " RM target plant (prod.plant)
-                     MODIF ID raw,
-            p_lgorrt TYPE lgort_d MODIF ID raw.               " RM target stor.loc
+                     MODIF ID raw.
 SELECTION-SCREEN END OF BLOCK b5.
 
 
@@ -204,6 +198,7 @@ CLASS lcl_app DEFINITION FINAL.
           mt_excl   TYPE SORTED TABLE OF zptp_301_excl WITH UNIQUE KEY aufnr,
           mt_out    TYPE tt_out,
           mt_orders TYPE tt_ord,          " open orders of the run (online mode creates from them)
+          mt_ovr    TYPE tt_out,          " storage locations typed in the grid for the lines to be created
           mv_simulate TYPE abap_bool,     " X = nothing is created or changed (test, online first pass)
           mv_run_id TYPE sysuuid_c32,
           mv_mode   TYPE c LENGTH 1,    " O / B
@@ -221,18 +216,24 @@ CLASS lcl_app DEFINITION FINAL.
     METHODS enrich_out.
     " Storage locations of a reservation item. Source: the storage location of
     " the order (IV_SRC) unless overridden on the screen. Target: table
-    " ZPTP_301_LGORT read with the source storage location, unless overridden.
+    " ZPTP_301_LGORT read with the source storage location.
     METHODS resolve_lgort
       IMPORTING iv_kind     TYPE c
                 iv_matnr    TYPE matnr
                 iv_werks_fr TYPE werks_d
                 iv_werks_to TYPE werks_d
                 iv_src      TYPE lgort_d
-                iv_ovr_fr   TYPE lgort_d
-                iv_ovr_to   TYPE lgort_d
       EXPORTING ev_lgor_fr  TYPE lgort_d
                 ev_lgor_to  TYPE lgort_d.
     METHODS check_lgort_table.
+    " Source storage location of a raw-material reservation: the storage location of
+    " the issuing plant where the batch has unrestricted stock (most stock first);
+    " component without batch: the storage location with the most unrestricted stock.
+    METHODS rm_source_lgort
+      IMPORTING iv_matnr       TYPE matnr
+                iv_werks       TYPE werks_d
+                iv_charg       TYPE charg_d
+      RETURNING VALUE(rv_lgort) TYPE lgort_d.
     " Target storage location from ZPTP_301_LGORT for one source storage location
     METHODS lookup_target
       IMPORTING iv_kind          TYPE c
@@ -300,7 +301,6 @@ CLASS lcl_app DEFINITION FINAL.
     METHODS change_reservation
       IMPORTING iv_close TYPE abap_bool
       CHANGING  cs_out   TYPE ty_out.
-    METHODS clear_logs.
     METHODS start_run_log.
     METHODS finish_run_log IMPORTING iv_status TYPE c.
     METHODS write_detail_log IMPORTING is_out TYPE ty_out.
@@ -330,7 +330,6 @@ CLASS lcl_app IMPLEMENTATION.
     mv_simulate = xsdbool( r_back = abap_false ).
 
     validate_selection( ).
-    clear_logs( ).
     start_run_log( ).
 
     load_exclusions( ).
@@ -408,22 +407,67 @@ CLASS lcl_app IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " Storage locations typed in the grid: taken over for the lines that will be
+    " created (no reservation yet). They must exist in their plant; an order with
+    " an invalid storage location is not processed.
+    DATA lt_bad TYPE SORTED TABLE OF aufnr WITH UNIQUE KEY table_line.
+    CLEAR mt_ovr.
+    LOOP AT mt_out ASSIGNING FIELD-SYMBOL(<e>)
+         WHERE rsnum IS INITIAL
+           AND ( status = gc_simulated OR statxt = 'Invalid storage location' ).
+      IF NOT line_exists( lt_sel[ table_line = <e>-aufnr ] ).
+        CONTINUE.
+      ENDIF.
+      DATA(lv_msg) = VALUE string( ).
+      IF <e>-lgort_fr IS NOT INITIAL.
+        SELECT SINGLE lgort FROM t001l INTO @DATA(lv_chk)
+          WHERE werks = @<e>-werks_fr AND lgort = @<e>-lgort_fr.
+        IF sy-subrc <> 0.
+          lv_msg = |Storage location { <e>-lgort_fr } does not exist in plant { <e>-werks_fr }|.
+        ENDIF.
+      ENDIF.
+      IF lv_msg IS INITIAL AND <e>-lgort_to IS NOT INITIAL.
+        SELECT SINGLE lgort FROM t001l INTO @lv_chk
+          WHERE werks = @<e>-werks_to AND lgort = @<e>-lgort_to.
+        IF sy-subrc <> 0.
+          lv_msg = |Storage location { <e>-lgort_to } does not exist in plant { <e>-werks_to }|.
+        ENDIF.
+      ENDIF.
+      IF lv_msg IS NOT INITIAL.
+        <e>-status  = gc_error.
+        <e>-statxt  = 'Invalid storage location'.
+        <e>-message = lv_msg.
+        INSERT <e>-aufnr INTO TABLE lt_bad.
+        CONTINUE.
+      ENDIF.
+      APPEND <e> TO mt_ovr.
+    ENDLOOP.
+
     LOOP AT mt_orders INTO DATA(ls_ord).
-      IF line_exists( lt_sel[ table_line = ls_ord-aufnr ] ).
+      IF line_exists( lt_sel[ table_line = ls_ord-aufnr ] )
+         AND NOT line_exists( lt_bad[ table_line = ls_ord-aufnr ] ).
         APPEND ls_ord TO lt_todo.
       ENDIF.
     ENDLOOP.
 
     LOOP AT lt_sel INTO DATA(lv_aufnr).
+      IF line_exists( lt_bad[ table_line = lv_aufnr ] ).
+        CONTINUE.                                    " keeps its lines, with the error
+      ENDIF.
       DELETE mt_out WHERE aufnr = lv_aufnr.
     ENDLOOP.
 
     mv_simulate = abap_false.
     process_list( lt_todo ).
     mv_simulate = abap_true.
+    CLEAR mt_ovr.
 
     enrich_out( ).
-    MESSAGE |{ lines( lt_todo ) } production order(s) processed| TYPE 'S'.
+    IF lt_bad IS NOT INITIAL.
+      MESSAGE |{ lines( lt_bad ) } order(s) not processed: invalid storage location| TYPE 'S' DISPLAY LIKE 'W'.
+    ELSE.
+      MESSAGE |{ lines( lt_todo ) } production order(s) processed| TYPE 'S'.
+    ENDIF.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -439,17 +483,6 @@ CLASS lcl_app IMPLEMENTATION.
     IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkfr. ENDIF.
     SELECT SINGLE werks FROM t001w INTO @lv_w WHERE werks = @p_werkto.
     IF sy-subrc <> 0. MESSAGE e040(zptp_split_val) WITH p_werkto. ENDIF.
-    " storage location existence (only if entered)
-    IF p_lgorfr IS NOT INITIAL.
-      SELECT SINGLE lgort FROM t001l INTO @DATA(lv_l)
-        WHERE werks = @p_werkfr AND lgort = @p_lgorfr.
-      IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH p_lgorfr p_werkfr. ENDIF.
-    ENDIF.
-    IF p_lgorto IS NOT INITIAL.
-      SELECT SINGLE lgort FROM t001l INTO @lv_l
-        WHERE werks = @p_werkto AND lgort = @p_lgorto.
-      IF sy-subrc <> 0. MESSAGE e041(zptp_split_val) WITH p_lgorto p_werkto. ENDIF.
-    ENDIF.
     " raw-material plants (only relevant when the option is active)
     IF gv_do_r = abap_true.
       IF p_werkrf IS INITIAL OR p_werkrt IS INITIAL OR p_werkrf = p_werkrt.
@@ -464,9 +497,30 @@ CLASS lcl_app IMPLEMENTATION.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
+  METHOD rm_source_lgort.
+    IF iv_charg IS NOT INITIAL.
+      SELECT lgort, clabs FROM mchb
+        WHERE matnr = @iv_matnr AND werks = @iv_werks AND charg = @iv_charg
+          AND clabs > 0
+        ORDER BY clabs DESCENDING
+        INTO (@rv_lgort, @DATA(lv_clabs))
+        UP TO 1 ROWS.
+      ENDSELECT.
+    ELSE.
+      SELECT lgort, labst FROM mard
+        WHERE matnr = @iv_matnr AND werks = @iv_werks
+          AND labst > 0
+        ORDER BY labst DESCENDING
+        INTO (@rv_lgort, @DATA(lv_labst))
+        UP TO 1 ROWS.
+      ENDSELECT.
+    ENDIF.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
   METHOD check_lgort_table.
-    " Storage locations maintained in ZPTP_301_LGORT for the plant pair(s) of
-    " this run must exist in the plant.
+    " Storage locations maintained in ZPTP_301_LGORT for the finished-product plant
+    " pair of this run must exist in the plant (raw materials do not use the table).
     DATA lt_chk TYPE STANDARD TABLE OF zptp_301_lgort WITH DEFAULT KEY.
 
     IF gv_do_h = abap_true.
@@ -474,12 +528,6 @@ CLASS lcl_app IMPLEMENTATION.
         WHERE res_kind = @gc_kind_h
           AND werks_fr = @p_werkfr
           AND werks_to = @p_werkto.
-    ENDIF.
-    IF gv_do_r = abap_true.
-      SELECT * FROM zptp_301_lgort APPENDING TABLE @lt_chk
-        WHERE res_kind = @gc_kind_r
-          AND werks_fr = @p_werkrf
-          AND werks_to = @p_werkrt.
     ENDIF.
 
     LOOP AT lt_chk ASSIGNING FIELD-SYMBOL(<l>).
@@ -498,8 +546,8 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD resolve_lgort.
-    " Source storage location: screen override, else the one given by the order.
-    " Target storage location: screen override, else table ZPTP_301_LGORT read with
+    " Source storage location: the one given by the order (finished product).
+    " Target storage location: table ZPTP_301_LGORT read with
     "   kind + plant pair + source storage location + material type (most specific
     "   entry wins: source storage location first, blank = any; then material
     "   type, blank = all).
@@ -509,7 +557,7 @@ CLASS lcl_app IMPLEMENTATION.
     "   table is used as source and target. If none gives a target, the source is
     "   the storage location with the most unrestricted stock (if any) and the
     "   target stays blank.
-    DATA(lv_src) = COND lgort_d( WHEN iv_ovr_fr IS NOT INITIAL THEN iv_ovr_fr ELSE iv_src ).
+    DATA(lv_src) = iv_src.
 
     READ TABLE mt_lgort INTO DATA(ls_c)
          WITH KEY kind = iv_kind matnr = iv_matnr
@@ -538,21 +586,19 @@ CLASS lcl_app IMPLEMENTATION.
         ENDIF.
       ENDIF.
 
-      IF iv_ovr_to IS INITIAL.
-        SELECT SINGLE mtart FROM mara INTO @DATA(lv_mtart) WHERE matnr = @iv_matnr.
-        LOOP AT lt_cand INTO DATA(lv_cand).
-          DATA(lv_to) = lookup_target( iv_kind     = iv_kind
-                                       iv_mtart    = lv_mtart
-                                       iv_werks_fr = iv_werks_fr
-                                       iv_werks_to = iv_werks_to
-                                       iv_lgort_fr = lv_cand ).
-          IF lv_to IS NOT INITIAL.
-            ls_c-lgort_fr = lv_cand.
-            ls_c-lgort_to = lv_to.
-            EXIT.
-          ENDIF.
-        ENDLOOP.
-      ENDIF.
+      SELECT SINGLE mtart FROM mara INTO @DATA(lv_mtart) WHERE matnr = @iv_matnr.
+      LOOP AT lt_cand INTO DATA(lv_cand).
+        DATA(lv_to) = lookup_target( iv_kind     = iv_kind
+                                     iv_mtart    = lv_mtart
+                                     iv_werks_fr = iv_werks_fr
+                                     iv_werks_to = iv_werks_to
+                                     iv_lgort_fr = lv_cand ).
+        IF lv_to IS NOT INITIAL.
+          ls_c-lgort_fr = lv_cand.
+          ls_c-lgort_to = lv_to.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
       " nothing mapped: keep the given source, or the one with the most stock
       IF ls_c-lgort_to IS INITIAL AND ls_c-lgort_fr IS INITIAL.
         ls_c-lgort_fr = lv_stock_first.
@@ -561,7 +607,7 @@ CLASS lcl_app IMPLEMENTATION.
     ENDIF.
 
     ev_lgor_fr = ls_c-lgort_fr.
-    ev_lgor_to = COND #( WHEN iv_ovr_to IS NOT INITIAL THEN iv_ovr_to ELSE ls_c-lgort_to ).
+    ev_lgor_to = ls_c-lgort_to.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -657,8 +703,6 @@ CLASS lcl_app IMPLEMENTATION.
                              iv_werks_fr = p_werkfr
                              iv_werks_to = p_werkto
                              iv_src      = is_order-lgort
-                             iv_ovr_fr   = p_lgorfr
-                             iv_ovr_to   = p_lgorto
                    IMPORTING ev_lgor_fr  = DATA(lv_lgor_fr)
                              ev_lgor_to  = DATA(lv_lgor_to) ).
 
@@ -694,7 +738,7 @@ CLASS lcl_app IMPLEMENTATION.
 
     " Open component requirements of the production order.
     " POSTP = 'L' -> stock item only (excludes non-stock 'N', text 'T', phantom).
-    SELECT rspos, matnr, bdmng, enmng, meins, werks, bdter, charg
+    SELECT rspos, matnr, bdmng, enmng, meins, werks, bdter, charg, lgort
       FROM resb INTO TABLE @DATA(lt_comp)
       WHERE aufnr = @is_order-aufnr
         AND werks = @p_werkrt          " requirement at the production plant
@@ -715,15 +759,14 @@ CLASS lcl_app IMPLEMENTATION.
       DATA(lv_short) = CONV menge_d( lv_req - lv_stock ).
       IF lv_short < 0. lv_short = 0. ENDIF.
 
-      resolve_lgort( EXPORTING iv_kind     = gc_kind_r
-                               iv_matnr    = <c>-matnr
-                               iv_werks_fr = p_werkrf
-                               iv_werks_to = p_werkrt
-                               iv_src      = space      " no source location in the order (8Q01 side)
-                               iv_ovr_fr   = p_lgorrf
-                               iv_ovr_to   = p_lgorrt
-                     IMPORTING ev_lgor_fr  = DATA(lv_rm_fr)
-                               ev_lgor_to  = DATA(lv_rm_to) ).
+      " Storage locations of a raw-material reservation (table ZPTP_301_LGORT is not used):
+      "   source = storage location of the issuing plant where the batch of the
+      "            component has unrestricted stock;
+      "   target = storage location of the component item in the production order.
+      DATA(lv_rm_fr) = rm_source_lgort( iv_matnr = <c>-matnr
+                                        iv_werks = p_werkrf
+                                        iv_charg = <c>-charg ).
+      DATA(lv_rm_to) = <c>-lgort.
 
       " short = 0 -> reconcile_item closes an existing RM item;
       " short > 0 -> realigns it, or collects the component in LT_NEW.
@@ -957,6 +1000,13 @@ CLASS lcl_app IMPLEMENTATION.
     ls_out-lgort_fr = iv_lgor_fr.
     ls_out-werks_to = iv_werks_to.
     ls_out-lgort_to = iv_lgor_to.
+    " storage locations typed in the grid of the online list replace the determined ones
+    READ TABLE mt_ovr INTO DATA(ls_ovr)
+         WITH KEY aufnr = iv_aufnr res_kind = iv_kind posnr = iv_posnr.
+    IF sy-subrc = 0.
+      ls_out-lgort_fr = ls_ovr-lgort_fr.
+      ls_out-lgort_to = ls_ovr-lgort_to.
+    ENDIF.
 
     " Existing reservation via link table (latest row for order+kind+item).
     " ORDER BY needs a set read + UP TO 1 ROWS (SELECT SINGLE cannot ORDER BY).
@@ -1003,20 +1053,6 @@ CLASS lcl_app IMPLEMENTATION.
         ls_out-rspos     = lv_link_rspos.
         ls_out-res_bdmng = ls_resb-bdmng.
         ls_out-res_enmng = ls_resb-enmng.
-      ENDIF.
-    ENDIF.
-
-    " reprocess-errors-only filter (latest logged status for this item)
-    IF p_erron = abap_true AND lv_has_res = abap_true.
-      DATA lv_last TYPE char1.
-      SELECT status FROM zptp_301_res_log
-        WHERE aufnr = @iv_aufnr AND res_kind = @iv_kind AND posnr = @iv_posnr
-        ORDER BY erdat DESCENDING, erzet DESCENDING
-        INTO @lv_last
-        UP TO 1 ROWS.
-      ENDSELECT.
-      IF lv_last <> gc_error.
-        RETURN.
       ENDIF.
     ENDIF.
 
@@ -1449,42 +1485,6 @@ CLASS lcl_app IMPLEMENTATION.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
-  METHOD clear_logs.
-    " Deletes ALL rows of the run log (ZPTP_301_RUN_LOG) and of the item log
-    " (ZPTP_301_RES_LOG) before the run. A test run changes nothing, so it
-    " never cleans. Existing reservations are still found through the
-    " goods recipient (RESB-WEMPF) when their log row is gone.
-    IF p_clrlg = abap_false.
-      RETURN.
-    ENDIF.
-    IF r_test = abap_true.
-      MESSAGE 'Logs are not cleaned in test mode' TYPE 'S'.
-      RETURN.
-    ENDIF.
-
-    IF sy-batch = abap_false.
-      DATA lv_answer TYPE c LENGTH 1.
-      CALL FUNCTION 'POPUP_TO_CONFIRM'
-        EXPORTING
-          titlebar              = 'Clean logs'
-          text_question         = 'All run logs and reservation logs will be deleted. Continue?'
-          default_button        = '2'
-          display_cancel_button = abap_false
-        IMPORTING
-          answer                = lv_answer
-        EXCEPTIONS
-          OTHERS                = 1.
-      IF sy-subrc <> 0 OR lv_answer <> '1'.
-        MESSAGE 'Run cancelled, logs not cleaned' TYPE 'E'.
-      ENDIF.
-    ENDIF.
-
-    DELETE FROM zptp_301_res_log.
-    DELETE FROM zptp_301_run_log.
-    COMMIT WORK.
-  ENDMETHOD.
-
-*---------------------------------------------------------------------*
   METHOD start_run_log.
     ms_counts = VALUE #( run_id     = mv_run_id
                          run_mode   = mv_mode
@@ -1584,6 +1584,10 @@ CLASS lcl_app IMPLEMENTATION.
         <f>-checkbox = abap_true.
         <f>-edit     = abap_true.
         <f>-just     = 'C'.
+      ENDIF.
+      IF ( <f>-fieldname = 'LGORT_FR' OR <f>-fieldname = 'LGORT_TO' ) AND r_onl = abap_true.
+        <f>-edit      = abap_true.                 " storage locations can be changed before creating
+        <f>-emphasize = 'C310'.
       ENDIF.
       IF <f>-fieldname = 'PO_OPEN' OR <f>-fieldname = 'RES_BDMNG'
       OR <f>-fieldname = 'RES_ENMNG' OR <f>-fieldname = 'TARGET_BDMNG'.

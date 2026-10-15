@@ -4,9 +4,12 @@
 *& Management of the 301 reservations created by
 *& ZPTP_301_RESERVATION_GENERATOR.
 *&
-*& The report reads the item log ZPTP_301_RES_LOG, takes for every order /
-*& kind / item the LATEST reservation item the generator created and reads
-*& it in RESB. Only items WITHOUT deletion indicator are listed, with
+*& The report finds the reservation items of the generator in three places:
+*& the item log ZPTP_301_RES_LOG (latest reservation item per order / kind /
+*& item), the transfer log ZPTP_301_TRF_LOG (items followed by a 301 posting,
+*& still found when the item log has been cleaned) and RESB (301 items whose
+*& goods recipient is the order number; only for a restricted selection).
+*& Only items WITHOUT deletion indicator are listed, with
 *&   - state          : Open / Closed (final issue, or required <= withdrawn)
 *&   - followed by 301: Yes / No (successful posting in ZPTP_301_TRF_LOG,
 *&                      material document not yet reversed)
@@ -71,6 +74,7 @@ CLASS lcl_app DEFINITION FINAL.
              meins    TYPE meins,
              mblnr    TYPE mblnr,                " last material document
              mjahr    TYPE mjahr,
+             origin   TYPE c LENGTH 14,          " where the item was found: log / transfer log / RESB
              action   TYPE c LENGTH 30,          " what POST will do
              message  TYPE string,
            END OF ty_out.
@@ -130,7 +134,7 @@ CLASS lcl_app IMPLEMENTATION.
   METHOD run.
     select_data( ).
     IF mt_out IS INITIAL.
-      MESSAGE 'No reservation created by the generator found for the selection' TYPE 'S'.
+      MESSAGE 'No reservation found for the selection (generator log, transfer log, RESB)' TYPE 'S'.
       RETURN.
     ENDIF.
     display_alv( ).
@@ -138,7 +142,25 @@ CLASS lcl_app IMPLEMENTATION.
 
 *---------------------------------------------------------------------*
   METHOD select_data.
-    " 1) latest reservation item per order / kind / item in the generator log
+    " Candidate reservation items. Three sources, in this order of priority:
+    "   a) the generator log ZPTP_301_RES_LOG: the LATEST reservation item per
+    "      order / kind / item;
+    "   b) the transfer log ZPTP_301_TRF_LOG: items that were followed by a 301 posting
+    "      (still found when the generator log has been cleaned);
+    "   c) RESB: 301 reservation items whose goods recipient is the order number (the
+    "      generator writes it there). Only when the selection is restricted
+    "      (reservation, order or material), to avoid reading the whole table.
+    TYPES: BEGIN OF ty_cand,
+             rsnum    TYPE rsnum,
+             rspos    TYPE rspos,
+             aufnr    TYPE aufnr,
+             res_kind TYPE c LENGTH 1,
+             werks_fr TYPE werks_d,
+             origin   TYPE c LENGTH 14,
+           END OF ty_cand.
+    DATA lt_cand TYPE SORTED TABLE OF ty_cand WITH UNIQUE KEY rsnum rspos.
+
+    " a) generator log
     SELECT aufnr, res_kind, posnr, rsnum, rspos, erdat, erzet, werks_fr, werks_to
       FROM zptp_301_res_log
       WHERE rsnum  <> @space
@@ -147,27 +169,57 @@ CLASS lcl_app IMPLEMENTATION.
         AND matnr  IN @so_matnr
         AND erdat  IN @so_erdat
       INTO TABLE @DATA(lt_log).
-    IF lt_log IS INITIAL.
-      RETURN.
-    ENDIF.
     SORT lt_log BY aufnr res_kind posnr ASCENDING erdat DESCENDING erzet DESCENDING.
     DELETE ADJACENT DUPLICATES FROM lt_log COMPARING aufnr res_kind posnr.
-
-    TYPES: BEGIN OF ty_key,
-             rsnum TYPE rsnum,
-             rspos TYPE rspos,
-           END OF ty_key.
-    DATA lt_key TYPE SORTED TABLE OF ty_key WITH UNIQUE KEY rsnum rspos.
     LOOP AT lt_log ASSIGNING FIELD-SYMBOL(<l>).
-      INSERT VALUE #( rsnum = <l>-rsnum rspos = <l>-rspos ) INTO TABLE lt_key.
+      INSERT VALUE #( rsnum = <l>-rsnum rspos = <l>-rspos aufnr = <l>-aufnr
+                      res_kind = <l>-res_kind werks_fr = <l>-werks_fr
+                      origin = 'Generator log' ) INTO TABLE lt_cand.
     ENDLOOP.
+
+    " b) transfer log: successful 301 postings
+    SELECT DISTINCT rsnum, rspos, aufnr, werks_fr
+      FROM zptp_301_trf_log
+      WHERE status = 'S'
+        AND mov_mblnr <> @space
+        AND rsnum IN @so_rsnum
+        AND aufnr IN @so_aufnr
+        AND matnr IN @so_matnr
+        AND erdat IN @so_erdat
+      INTO TABLE @DATA(lt_tk).
+    LOOP AT lt_tk ASSIGNING FIELD-SYMBOL(<k>).
+      INSERT VALUE #( rsnum = <k>-rsnum rspos = <k>-rspos aufnr = <k>-aufnr
+                      werks_fr = <k>-werks_fr origin = 'Transfer log' ) INTO TABLE lt_cand.
+    ENDLOOP.
+
+    " c) RESB goods recipient (only for a restricted selection)
+    IF so_rsnum IS NOT INITIAL OR so_aufnr IS NOT INITIAL OR so_matnr IS NOT INITIAL.
+      SELECT rsnum, rspos, wempf, werks
+        FROM resb
+        WHERE bwart  = '301'
+          AND wempf <> @space
+          AND xloek  = @space
+          AND rsnum IN @so_rsnum
+          AND wempf IN @so_aufnr
+          AND matnr IN @so_matnr
+        INTO TABLE @DATA(lt_wk).
+      LOOP AT lt_wk ASSIGNING FIELD-SYMBOL(<w>).
+        INSERT VALUE #( rsnum = <w>-rsnum rspos = <w>-rspos
+                        aufnr = CONV aufnr( <w>-wempf ) werks_fr = <w>-werks
+                        origin = 'RESB recipient' ) INTO TABLE lt_cand.
+      ENDLOOP.
+    ENDIF.
+
+    IF lt_cand IS INITIAL.
+      RETURN.
+    ENDIF.
 
     " 2) the reservation items that still exist (deletion indicator not set)
     SELECT rsnum, rspos, matnr, werks, umwrk, bdmng, enmng, meins, wempf, kzear
       FROM resb
-      FOR ALL ENTRIES IN @lt_key
-      WHERE rsnum = @lt_key-rsnum
-        AND rspos = @lt_key-rspos
+      FOR ALL ENTRIES IN @lt_cand
+      WHERE rsnum = @lt_cand-rsnum
+        AND rspos = @lt_cand-rspos
         AND xloek = @space
       INTO TABLE @DATA(lt_resb).
     IF lt_resb IS INITIAL.
@@ -213,20 +265,21 @@ CLASS lcl_app IMPLEMENTATION.
     SORT lt_makt BY matnr.
 
     " 4) result lines (one per reservation item)
-    LOOP AT lt_log ASSIGNING <l>.
+    LOOP AT lt_cand ASSIGNING FIELD-SYMBOL(<c>).
       READ TABLE lt_resb ASSIGNING FIELD-SYMBOL(<r>)
-           WITH KEY rsnum = <l>-rsnum rspos = <l>-rspos BINARY SEARCH.
+           WITH KEY rsnum = <c>-rsnum rspos = <c>-rspos BINARY SEARCH.
       IF sy-subrc <> 0.
         CONTINUE.                                      " deleted: not listed
       ENDIF.
       DATA(ls_out) = VALUE ty_out(
         rsnum    = <r>-rsnum
         rspos    = <r>-rspos
-        aufnr    = <l>-aufnr
-        res_kind = <l>-res_kind
+        aufnr    = <c>-aufnr
+        res_kind = <c>-res_kind
+        origin   = <c>-origin
         matnr    = <r>-matnr
         maktx    = VALUE #( lt_makt[ matnr = <r>-matnr ]-maktx OPTIONAL )
-        werks_fr = <l>-werks_fr
+        werks_fr = <c>-werks_fr
         werks_to = <r>-umwrk
         bdmng    = <r>-bdmng
         enmng    = <r>-enmng
@@ -448,6 +501,7 @@ CLASS lcl_app IMPLEMENTATION.
     _col 'MEINS'    'UoM'              3.
     _col 'MBLNR'    'Mat. doc'         10.
     _col 'MJAHR'    'Year'             4.
+    _col 'ORIGIN'   'Found via'        14.
     _col 'ACTION'   'Action on POST'   26.
     _col 'MESSAGE'  'Message'          60.
 
