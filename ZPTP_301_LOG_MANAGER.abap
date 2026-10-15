@@ -70,7 +70,9 @@ CLASS lcl_app DEFINITION FINAL.
              posnr      TYPE co_posnr,
              rsnum      TYPE rsnum,
              rspos      TYPE rspos,
-             last_stat  TYPE c LENGTH 1,            " last status in ZPTP_301_RES_LOG
+             rsdat      TYPE rsdat,                 " reservation date (RKPF-RSDAT)
+             usnam      TYPE usnam,                 " user who created the reservation (RKPF-USNAM)
+             last_stat  TYPE c LENGTH 1,            " last status in ZPTP_301_RES_LOG, or D = delivered
              stat_txt   TYPE c LENGTH 10,
              resb_state TYPE c LENGTH 8,            " Open / Closed / Deleted / Missing / -
              bdmng      TYPE bdmng,                 " RESB required quantity
@@ -265,6 +267,15 @@ CLASS lcl_app IMPLEMENTATION.
     SORT lt_trf BY rsnum rspos erdat erzet.
 
     " 3) reservation items in RESB (also deleted ones: they must be told apart)
+    " reservation header: date and creator
+    SELECT rsnum, rsdat, usnam
+      FROM rkpf
+      FOR ALL ENTRIES IN @lt_key_std
+      WHERE rsnum = @lt_key_std-rsnum
+        AND rsnum <> @space
+      INTO TABLE @DATA(lt_rkpf).
+    SORT lt_rkpf BY rsnum.
+
     SELECT rsnum, rspos, bdmng, enmng, kzear, xloek, meins, wempf
       FROM resb
       FOR ALL ENTRIES IN @lt_key_std
@@ -467,35 +478,57 @@ CLASS lcl_app IMPLEMENTATION.
       ls_out-in_trf = xsdbool( ls_out-n_trf > 0 ).
       ls_out-in_run = xsdbool( ls_out-n_run > 0 ).
 
+      " reservation header data
+      IF <k>-rsnum IS NOT INITIAL.
+        READ TABLE lt_rkpf ASSIGNING FIELD-SYMBOL(<hd>) WITH KEY rsnum = <k>-rsnum BINARY SEARCH.
+        IF sy-subrc = 0.
+          ls_out-rsdat = <hd>-rsdat.
+          ls_out-usnam = <hd>-usnam.
+        ENDIF.
+      ENDIF.
+
+      " followed by a 301 movement (posting not reversed): status D = Delivered.
+      " The consistency check above used the status of the generator log.
+      IF ls_out-mov_qty > 0.
+        ls_out-last_stat = 'D'.
+        ls_out-stat_txt  = 'Delivered'.
+      ENDIF.
+
       color_row( CHANGING cs_out = ls_out ).
       APPEND ls_out TO mt_out.
     ENDLOOP.
-    SORT mt_out BY aufnr res_kind rsnum rspos.
+    SORT mt_out BY aufnr rsdat rsnum rspos.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
   METHOD color_row.
     " Kind and last status are highlighted (palette colours of the ALV grid):
     "   kind   : H blue-green (4), R orange (7)
-    "   status : C / N / F green (5), R yellow (3), X dark grey (1), K light grey (2),
-    "            E red (6), S blue-green (4)
+    "   status : C / N / F green (5), R yellow (3), X grey-blue (1), K light grey (2),
+    "            E red (6), S blue-green (4),
+    "            D delivered: darkest colour of the palette (1 intensified). The ALV
+    "            grid has no black background and chooses the text colour itself, so
+    "            white on black can only be approximated.
     DATA(lv_kind_col) = SWITCH i( cs_out-res_kind WHEN 'H' THEN 4 WHEN 'R' THEN 7 ELSE 0 ).
     IF lv_kind_col > 0.
       APPEND VALUE #( fname = 'RES_KIND' color = VALUE #( col = lv_kind_col int = 1 inv = 0 ) )
              TO cs_out-coltab.
     ENDIF.
-    DATA(lv_st_col) = SWITCH i( cs_out-last_stat
-                                WHEN 'C' THEN 5 WHEN 'N' THEN 5 WHEN 'F' THEN 5
-                                WHEN 'R' THEN 3
-                                WHEN 'X' THEN 1
-                                WHEN 'K' THEN 2
-                                WHEN 'E' THEN 6
-                                WHEN 'S' THEN 4
-                                ELSE 0 ).
-    IF lv_st_col > 0.
-      APPEND VALUE #( fname = 'LAST_STAT' color = VALUE #( col = lv_st_col int = 1 inv = 0 ) )
+    DATA: lv_col TYPE i,
+          lv_int TYPE i VALUE 1.
+    CASE cs_out-last_stat.
+      WHEN 'C' OR 'N' OR 'F'. lv_col = 5.
+      WHEN 'R'.               lv_col = 3.
+      WHEN 'X'.               lv_col = 1. lv_int = 0.
+      WHEN 'K'.               lv_col = 2.
+      WHEN 'E'.               lv_col = 6.
+      WHEN 'S'.               lv_col = 4.
+      WHEN 'D'.               lv_col = 1. lv_int = 1.
+    ENDCASE.
+    IF lv_col > 0.
+      APPEND VALUE #( fname = 'LAST_STAT' color = VALUE #( col = lv_col int = lv_int inv = 0 ) )
              TO cs_out-coltab.
-      APPEND VALUE #( fname = 'STAT_TXT' color = VALUE #( col = lv_st_col int = 1 inv = 0 ) )
+      APPEND VALUE #( fname = 'STAT_TXT' color = VALUE #( col = lv_col int = lv_int inv = 0 ) )
              TO cs_out-coltab.
     ENDIF.
   ENDMETHOD.
@@ -599,6 +632,8 @@ CLASS lcl_app IMPLEMENTATION.
     _col 'POSNR'      'Order item'       6.
     _col 'RSNUM'      'Reservation'      10.
     _col 'RSPOS'      'Item'             4.
+    _col 'RSDAT'      'Res. date'        10.
+    _col 'USNAM'      'Created by'       12.
     _col 'LAST_STAT'  'St.'              3.
     _col 'STAT_TXT'   'Last status'      10.
     _col 'RESB_STATE' 'RESB state'       8.
@@ -635,10 +670,9 @@ CLASS lcl_app IMPLEMENTATION.
       ENDCASE.
     ENDLOOP.
 
-    lt_sort = VALUE #( ( spos = 1 fieldname = 'AUFNR'    up = abap_true group = 'UL' )
-                       ( spos = 2 fieldname = 'RES_KIND' up = abap_true )
-                       ( spos = 3 fieldname = 'RSNUM'    up = abap_true )
-                       ( spos = 4 fieldname = 'RSPOS'    up = abap_true ) ).
+    " grouped by production order only; inside an order sorted by reservation date
+    lt_sort = VALUE #( ( spos = 1 fieldname = 'AUFNR' up = abap_true group = 'UL' )
+                       ( spos = 2 fieldname = 'RSDAT' up = abap_true ) ).
 
     ls_layout-box_fname  = 'SEL'.                       " row selection
     ls_layout-ctab_fname = 'COLTAB'.                    " cell colours: kind and status

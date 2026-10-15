@@ -475,13 +475,14 @@ Use it to check the three log tables of the process and to clean them item by it
 | Clean all logs | After a warning that shows the number of rows, deletes **all** rows of the three log tables, whatever the selection, and ends the program without a list. |
 
 ### 5.2 The list
-One line per reservation item of the logs. The most important columns:
+One line per reservation item of the logs. The list is **grouped by production order** only, and inside each order **sorted by reservation date**. The most important columns:
 
 | Column | Meaning |
 |---|---|
 | **Check** | Green: the logs are consistent. Yellow: a difference to look at. Red: an inconsistency |
 | **Kind** (coloured) | `H` finished product (blue-green), `R` raw material (orange) |
-| **Last status** (coloured) | Status of the item in its latest generator log row: *Created*, *Realigned*, *Unchanged*, *Complete* (green or yellow), *Closed* (dark grey), *Skipped* (light grey), *Error* (red), *Simulated* |
+| Res. date, Created by | Reservation date (`RKPF-RSDAT`) and the user who created the reservation (`RKPF-USNAM`). For reservations of the generator the reservation date is the *Reservation requirement date* of the run, not necessarily the day of creation |
+| **Last status** (coloured) | Status of the item in its latest generator log row: *Created*, *Realigned*, *Unchanged*, *Complete* (green or yellow), *Closed* (grey-blue), *Skipped* (light grey), *Error* (red), *Simulated*. **D = Delivered** when the item is followed by a 301 posting that is not reversed: shown in the darkest colour of the ALV palette (the grid has no black background and chooses the text colour, so white on black can only be approached) |
 | RESB state | *Open*, *Closed*, *Deleted* or *Missing*: the real state of the reservation item in SAP |
 | Req. qty / Withdrawn (RESB), Req. qty (log) | Quantities in SAP and in the log |
 | 301 posted, Last 301 doc | 301 postings of the transfer log that are not reversed |
