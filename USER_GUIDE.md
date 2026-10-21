@@ -244,7 +244,7 @@ One line per reservation item. The most important columns:
 
 **Deleted and closed reservation items.** A reservation item that was **deleted** in SAP is treated as if it had never been created: the generator creates a new reservation for the open quantity and never changes the deleted item. A **closed** item (final issue set) is shown as *Complete* and left alone. An item that you only closed by setting its required quantity equal to the withdrawn quantity is not treated as closed: if the order still has open quantity, the generator realigns it.
 
-Every run is also stored in the run log with the counters (created, realigned, closed, unchanged, skipped, errors).
+Every run is also stored in the run log with the counters (created, realigned, closed, unchanged, skipped, errors). The item log (`ZPTP_301_RES_LOG`) only receives the lines with status *Created*, *Realigned*, *Closed*, *Complete* or *Error*; *Unchanged*, *Skipped* and *Simulated* lines appear in the list only. Exception: a reservation of the generator that had lost its log row is logged again whatever its status, so that it reappears in the transfer report.
 
 **Layout of the list**
 - The lines are **sorted and grouped by production order** first, then by item, then by kind (`H` finished product, `R` raw material). The *Kind* column is next to *Item*.
@@ -305,7 +305,7 @@ The program does not reschedule itself. To run it regularly, schedule it as a re
 ## 3. Transfer report — `ZPTP_301_TRF`
 
 ### 3.1 Before you start
-- Reservations must exist; run the generator first (section 2).
+- Reservations must exist; run the generator first (section 2). The report lists **only reservations created by the generator** (those that have a row in the generator log). A reservation created by hand in MB21 is not listed; a message at the start says how many open 301 items were left out for this reason. If a generator reservation is missing because its log was deleted, run the generator once for that order (not in test mode): it finds the reservation again and logs it.
 - The material must be available as **unrestricted** stock in the source plant.
 - For batch-managed materials, know the batch you want to move.
 
@@ -460,7 +460,7 @@ Use it to check the three log tables of the process and to clean them item by it
 
 | Log table | Content |
 |---|---|
-| `ZPTP_301_RES_LOG` | One row per reservation item and generator run (kind, status, quantities) |
+| `ZPTP_301_RES_LOG` | One row per reservation item and generator run in which the item was created, realigned, closed, found complete or ended in error (kind, status, quantities). *Unchanged* and *Skipped* results are not logged |
 | `ZPTP_301_TRF_LOG` | One row per 301 posting attempt of the transfer report, and per reversal (status *R*) |
 | `ZPTP_301_RUN_LOG` | One row per generator run, with its counters |
 
@@ -473,6 +473,8 @@ Use it to check the three log tables of the process and to clean them item by it
 | Run ID | Limit by run (generator run ID, or transfer run ID) |
 | Execution date | Limit by the date of the log rows |
 | Clean all logs | After a warning that shows the number of rows, deletes **all** rows of the three log tables, whatever the selection, and ends the program without a list. |
+| Delete history before date, Date | Deletes the log rows **older than the date**, for the production orders and reservations of the selection (empty = all). Two safeguards: the **latest row of every item** in the item log is kept, and the transfer-log rows of **301 postings that are not reversed** are kept. Runs started before the date that have no item row left are deleted from the run log. A warning shows the numbers of rows first; afterwards the list is shown. Cannot be combined with *Clean all logs* |
+| Delete rows by status, Statuses | Deletes only the item-log rows with the statuses entered (proposed: **S** *Simulated* and **K** *Skipped*; **N** *Unchanged* can be added; other statuses are refused), for the selection (order, reservation, run ID, date; empty = all). S rows were written by versions of the generator up to 12.10.2026, K and N rows by all versions before 15.10.2026; none of them is needed. For N rows, the latest row with a reservation number of each item is kept, so the generator keeps its link. Runs left without item rows are deleted from the run log. Warning with the count first; the list is shown afterwards. Only one of the three options can be ticked |
 
 ### 5.2 The list
 One line per reservation item of the logs. The list is **grouped by production order** only, and inside each order **sorted by reservation date**. The most important columns:
@@ -488,6 +490,8 @@ One line per reservation item of the logs. The list is **grouped by production o
 | 301 posted, Last 301 doc | 301 postings of the transfer log that are not reversed |
 | **In Run Log**, **In Res Log**, **In TRF Log** (checkboxes) | Whether the record of the item is present in the run log, in the item log and in the transfer log. A reservation record that is missing from a log is a sign of an inconsistency (for example after cleaning a table) |
 | Rows item log / transfer log, Runs in run log | How many log rows the item has in each table |
+| Last run ID, Last date | Run ID and date of the latest generator log row of the item (empty when the item has no row in the item log) |
+| Last transfer run ID, Last posting date | Run ID of the transfer report and date of the latest 301 posting of the item (empty when it has never been posted) |
 | **Consistency check** | The reason for a yellow or red light |
 
 ### 5.3 What the consistency check looks at
@@ -521,6 +525,16 @@ Use transaction **SM30** for these tables.
 | `ZPTP_301_CTRL` | One row for the plant pair 8P01 → 8Q01, with **Active** ticked. It enables the valuation-type logic for the finished-product transfer. |
 | `ZPTP_301_LGORT` | The **target storage location** of the **finished-product** reservations (8P01 → 8Q01). Key: direction (`H`), issuing plant, receiving plant, **source storage location** (blank = any) and material type (blank = all). The most specific row wins: first the row for the source storage location, then the row for the material type. Both storage locations must exist in their plant. Raw-material reservations do not use this table (their storage locations come from the batch stock and the production order, see section 2.2). Changing the table does not change reservations that already exist. |
 | `ZPTP_301_VALTYPE` | The destination **valuation type** per destination plant, material type and fiscal year. A blank plant or material type means "all". Add the rows for the next fiscal year **before the year starts**, or transfers dated in the new year are refused. Keep a blank-material-type row as a fallback for each year. |
+
+**Maintaining the valuation types: transaction `ZPTP_301_VALT`.** It works also in production, where SM30 is closed:
+1. Enter a destination plant, material type or fiscal year to limit the list (or nothing for all rows) and execute.
+2. Change the **valuation type**, **comment** or **active** flag directly in the list. The plant, material type and fiscal year of an existing row cannot be changed: delete the row and create a new one.
+3. To create a row (for example for the next fiscal year), use **Insert row** or **Append row** in the list toolbar and fill in all fields. Leave the plant or the material type empty for "all".
+4. To delete rows, select them and use **Delete row**.
+   **New fiscal year:** select the rows of the current year (row selectors on the left) and press **Copy to next year**. The copies appear in the list with the next fiscal year and a yellow light (*Copied from …, not saved yet*); rows that already exist for the next year are skipped. Change the valuation type where needed.
+5. Press **Save**. The program checks the rows first: rows in error get a red light and the reason, and nothing is saved until they are corrected. Deleting active rows of the current or a future fiscal year asks for confirmation, because transfers without a valuation type are refused.
+
+Only users with the change authorization can edit; others see the list only. One user at a time can be in change mode.
 
 The exclusion list is stored in the table `ZPTP_301_EXCL`; it is filled through the spreadsheet upload and is not normally edited by hand.
 

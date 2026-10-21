@@ -115,7 +115,8 @@ CLASS lcl_app DEFINITION FINAL.
 
   PRIVATE SECTION.
     DATA: mt_out    TYPE tt_out,
-          mv_run_id TYPE sysuuid_c32.
+          mv_run_id TYPE sysuuid_c32,
+          mv_not_gen TYPE i.                    " open reservations not listed: not from the generator
 
     METHODS check_plants.
     METHODS select_data.
@@ -150,8 +151,15 @@ CLASS lcl_app IMPLEMENTATION.
     check_plants( ).
     select_data( ).
     IF mt_out IS INITIAL.
-      MESSAGE s052(zptp_split_val).                    " no open 301 reservations found
+      IF mv_not_gen > 0.
+        MESSAGE |No reservation of the generator found; { mv_not_gen } other open 301 item(s) not listed| TYPE 'S'.
+      ELSE.
+        MESSAGE s052(zptp_split_val).                  " no open 301 reservations found
+      ENDIF.
       RETURN.
+    ENDIF.
+    IF mv_not_gen > 0.
+      MESSAGE |{ mv_not_gen } open 301 item(s) not created by the generator are not listed| TYPE 'S'.
     ENDIF.
     display_alv( ).
   ENDMETHOD.
@@ -220,6 +228,31 @@ CLASS lcl_app IMPLEMENTATION.
           AND xloek  = @space
           AND kzear  = @space
           AND xwaok  = @abap_true.
+    ENDLOOP.
+    IF lt_resb IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " Only reservations of the generator: the item must have a row with its
+    " reservation number in the generator log ZPTP_301_RES_LOG. Reservations
+    " created by hand (MB21) or whose log rows were deleted are not listed.
+    SELECT DISTINCT rsnum, rspos
+      FROM zptp_301_res_log
+      FOR ALL ENTRIES IN @lt_resb
+      WHERE rsnum = @lt_resb-rsnum
+        AND rspos = @lt_resb-rspos
+      INTO TABLE @DATA(lt_gen).
+    SORT lt_gen BY rsnum rspos.
+    CLEAR mv_not_gen.
+    LOOP AT lt_resb ASSIGNING FIELD-SYMBOL(<g>).
+      READ TABLE lt_gen TRANSPORTING NO FIELDS
+           WITH KEY rsnum = <g>-rsnum rspos = <g>-rspos BINARY SEARCH.
+      IF sy-subrc <> 0.
+        IF <g>-bdmng > <g>-enmng.                       " count only items still open
+          mv_not_gen = mv_not_gen + 1.
+        ENDIF.
+        DELETE lt_resb.
+      ENDIF.
     ENDLOOP.
     IF lt_resb IS INITIAL.
       RETURN.

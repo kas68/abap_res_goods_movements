@@ -146,7 +146,8 @@ CLASS lcl_app DEFINITION FINAL.
              statxt       TYPE string,
              message      TYPE string,
              coltab       TYPE lvc_t_scol,    " ALV row colour
-             cellstyle    TYPE lvc_t_styl,    " ALV cell style (bold)
+             cellstyle    TYPE lvc_t_styl,    " ALV cell style
+             relink       TYPE abap_bool,     " reservation found without generator log row: log it (link)
            END OF ty_out.
     TYPES tt_out TYPE STANDARD TABLE OF ty_out WITH DEFAULT KEY.
 
@@ -1024,7 +1025,9 @@ CLASS lcl_app IMPLEMENTATION.
     " goods recipient (RESB-WEMPF) at creation. MATNR/WERKS/XLOEK match RESB
     " secondary index M. Deleted items are ignored (as if never created);
     " closed items (final issue) are found so that nothing is done for them.
+    DATA lv_from_fallback TYPE abap_bool.
     IF lv_link_rsnum IS INITIAL.
+      lv_from_fallback = abap_true.
       SELECT rsnum, rspos FROM resb ##NULL_VALUES
         WHERE matnr = @iv_matnr
           AND werks = @iv_werks_fr
@@ -1053,6 +1056,10 @@ CLASS lcl_app IMPLEMENTATION.
         ls_out-rspos     = lv_link_rspos.
         ls_out-res_bdmng = ls_resb-bdmng.
         ls_out-res_enmng = ls_resb-enmng.
+        " found through RESB only (no generator log row): the line is logged whatever
+        " its status, so that the reservation gets its link row again (the transfer
+        " report lists only reservations that have a row in the generator log)
+        ls_out-relink    = lv_from_fallback.
       ENDIF.
     ENDIF.
 
@@ -1523,6 +1530,17 @@ CLASS lcl_app IMPLEMENTATION.
     IF mv_simulate = abap_true.
       RETURN.
     ENDIF.
+    " Only the results that matter are logged: created (C), realigned (R),
+    " closed (X), complete (F) and error (E). Unchanged (N) and skipped (K)
+    " lines are shown in the result list but not written to the item log.
+    " Exception: a reservation found without a log row (RELINK) is always logged,
+    " so that it gets its link row back.
+    IF NOT ( is_out-status = gc_created   OR is_out-status = gc_realigned
+          OR is_out-status = gc_closed    OR is_out-status = gc_complete
+          OR is_out-status = gc_error )
+       AND is_out-relink = abap_false.
+      RETURN.
+    ENDIF.
     DATA ls_log TYPE zptp_301_res_log.
     ls_log = VALUE #( aufnr     = is_out-aufnr
                       res_kind  = is_out-res_kind
@@ -1543,6 +1561,10 @@ CLASS lcl_app IMPLEMENTATION.
                       erzet     = sy-uzeit
                       ernam     = sy-uname ).
     MODIFY zptp_301_res_log FROM @ls_log.
+    " Committed at once: the reservation itself is already committed by the BAPI,
+    " so a later BAPI_TRANSACTION_ROLLBACK (failure on another order) or a dump
+    " must not undo its log row.
+    COMMIT WORK.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*

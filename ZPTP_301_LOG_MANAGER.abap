@@ -43,7 +43,8 @@ TYPE-POOLS: abap, icon.
 *---------------------------------------------------------------------*
 DATA: gv_aufnr TYPE aufnr,
       gv_rsnum TYPE rsnum,
-      gv_runid TYPE sysuuid_c32.
+      gv_runid TYPE sysuuid_c32,
+      gv_stat  TYPE c LENGTH 1.
 
 SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.   " Selection
 SELECT-OPTIONS: so_aufnr FOR gv_aufnr,                          " production order
@@ -53,7 +54,11 @@ SELECT-OPTIONS: so_aufnr FOR gv_aufnr,                          " production ord
 SELECTION-SCREEN END OF BLOCK b1.
 
 SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.   " Options
-PARAMETERS: p_clrlg AS CHECKBOX.                                " clean all logs (the 3 log tables)
+PARAMETERS: p_clrlg AS CHECKBOX,                                " clean all logs (the 3 log tables)
+            p_purge AS CHECKBOX,                                " delete history before date
+            p_dels  AS CHECKBOX,                                " delete rows by status
+            p_pdate TYPE datum.                                 " date for 'delete history before date'
+SELECT-OPTIONS: so_stat FOR gv_stat NO INTERVALS.               " ... statuses (S / K / N only)
 SELECTION-SCREEN END OF BLOCK b2.
 
 *---------------------------------------------------------------------*
@@ -88,6 +93,8 @@ CLASS lcl_app DEFINITION FINAL.
              in_trf     TYPE abap_bool,             " the record is in the transfer log
              last_run   TYPE sysuuid_c32,
              last_date  TYPE erdat,
+             trf_run    TYPE sysuuid_c32,           " run ID of the transfer report, latest 301 posting
+             trf_date   TYPE erdat,                 " date of the latest 301 posting
              meins      TYPE meins,
              blocked    TYPE abap_bool,             " active 301 posting: cannot be deleted
              done       TYPE abap_bool,             " log records deleted in this session
@@ -113,6 +120,10 @@ CLASS lcl_app DEFINITION FINAL.
     DATA mt_out TYPE tt_out.
 
     METHODS select_data.
+    METHODS purge_by_status
+      RETURNING VALUE(rv_done) TYPE abap_bool.
+    METHODS purge_history
+      RETURNING VALUE(rv_done) TYPE abap_bool.
     METHODS clear_logs
       RETURNING VALUE(rv_done) TYPE abap_bool.
     METHODS color_row
@@ -128,6 +139,12 @@ DATA go_app TYPE REF TO lcl_app.
 CLASS lcl_app IMPLEMENTATION.
 
   METHOD run.
+    IF ( p_clrlg = abap_true AND p_purge = abap_true )
+    OR ( p_clrlg = abap_true AND p_dels  = abap_true )
+    OR ( p_purge = abap_true AND p_dels  = abap_true ).
+      MESSAGE 'Choose only one option: Clean all logs, Delete history before date or Delete rows by status' TYPE 'E'.
+    ENDIF.
+
     " Option 'Clean all logs': after the warning, all three tables are emptied
     IF p_clrlg = abap_true.
       IF clear_logs( ) = abap_true.
@@ -137,12 +154,244 @@ CLASS lcl_app IMPLEMENTATION.
       ENDIF.
     ENDIF.
 
+    " Option 'Delete rows by status': rows with status S / K / N are deleted, then the list is shown
+    IF p_dels = abap_true.
+      IF so_stat IS INITIAL.
+        MESSAGE 'Enter the statuses to delete (S, K or N)' TYPE 'E'.
+      ENDIF.
+      LOOP AT so_stat ASSIGNING FIELD-SYMBOL(<st>).
+        IF <st>-sign <> 'I' OR <st>-option <> 'EQ' OR <st>-low NA 'SKN' OR <st>-low IS INITIAL.
+          MESSAGE 'Only the statuses S (simulated), K (skipped) and N (unchanged) can be deleted' TYPE 'E'.
+        ENDIF.
+      ENDLOOP.
+      IF purge_by_status( ) = abap_false.
+        MESSAGE 'Run cancelled, rows not deleted' TYPE 'E'.
+      ENDIF.
+    ENDIF.
+
+    " Option 'Delete history before date': old rows are deleted, then the list is shown
+    IF p_purge = abap_true.
+      IF p_pdate IS INITIAL.
+        MESSAGE 'Enter the date for Delete history before date' TYPE 'E'.
+      ENDIF.
+      IF purge_history( ) = abap_false.
+        MESSAGE 'Run cancelled, history not deleted' TYPE 'E'.
+      ENDIF.
+    ENDIF.
+
     select_data( ).
     IF mt_out IS INITIAL.
       MESSAGE 'No log record found for the selection' TYPE 'S'.
       RETURN.
     ENDIF.
     display_alv( ).
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD purge_by_status.
+    " Deletes the item-log rows whose status is in SO_STAT (only S simulated,
+    " K skipped, N unchanged are allowed), for the selection (order, reservation,
+    " run ID, date; empty = all). Rows C / R / X / F / E are never deleted here.
+    "   S and K rows never stand for a reservation of the generator.
+    "   N rows carry the reservation number: the LATEST row with a reservation
+    "   number of an item is kept when it is an N row, so the generator keeps
+    "   its link to the reservation.
+    " Runs that have no item row left are deleted from the run log.
+    SELECT aufnr, res_kind, posnr, run_id, status, rsnum
+      FROM zptp_301_res_log
+      WHERE status IN @so_stat
+        AND ( status = 'S' OR status = 'K' OR status = 'N' )
+        AND aufnr  IN @so_aufnr
+        AND rsnum  IN @so_rsnum
+        AND run_id IN @so_runid
+        AND erdat  IN @so_erdat
+      INTO TABLE @DATA(lt_cand).
+
+    " protect the latest row with a reservation number of each item (link row)
+    TYPES: BEGIN OF ty_link,
+             aufnr    TYPE aufnr,
+             res_kind TYPE c LENGTH 1,
+             posnr    TYPE co_posnr,
+             run_id   TYPE sysuuid_c32,
+             erdat    TYPE erdat,
+             erzet    TYPE erzet,
+           END OF ty_link.
+    DATA lt_link TYPE STANDARD TABLE OF ty_link WITH DEFAULT KEY.
+    DATA(lt_n) = lt_cand.
+    DELETE lt_n WHERE status <> 'N'.
+    IF lt_n IS NOT INITIAL.
+      SELECT aufnr, res_kind, posnr, run_id, erdat, erzet
+        FROM zptp_301_res_log
+        FOR ALL ENTRIES IN @lt_n
+        WHERE aufnr    = @lt_n-aufnr
+          AND res_kind = @lt_n-res_kind
+          AND posnr    = @lt_n-posnr
+          AND rsnum   <> @space
+        INTO TABLE @lt_link.
+      SORT lt_link BY aufnr res_kind posnr erdat DESCENDING erzet DESCENDING.
+      DELETE ADJACENT DUPLICATES FROM lt_link COMPARING aufnr res_kind posnr.
+    ENDIF.
+    DATA lv_kept TYPE i.
+    LOOP AT lt_cand ASSIGNING FIELD-SYMBOL(<c0>) WHERE status = 'N'.
+      IF line_exists( lt_link[ aufnr = <c0>-aufnr res_kind = <c0>-res_kind
+                               posnr = <c0>-posnr run_id = <c0>-run_id ] ).
+        DELETE lt_cand.
+        lv_kept = lv_kept + 1.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_cand IS INITIAL.
+      MESSAGE |No row to delete for the statuses and the selection ({ lv_kept } link rows kept)| TYPE 'S'.
+      rv_done = abap_true.
+      RETURN.
+    ENDIF.
+
+    DATA lv_answer TYPE c LENGTH 1.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'Delete rows by status'
+        text_question         = |{ lines( lt_cand ) } item log rows with the chosen statuses will be deleted ({ lv_kept } link rows kept), then the runs left without item rows. Continue?|
+        text_button_1         = 'Continue'
+        text_button_2         = 'Cancel run'
+        icon_button_1         = 'ICON_OKAY'
+        icon_button_2         = 'ICON_CANCEL'
+        default_button        = '2'
+        display_cancel_button = abap_false
+        popup_type            = 'ICON_MESSAGE_WARNING'
+      IMPORTING
+        answer                = lv_answer
+      EXCEPTIONS
+        OTHERS                = 1.
+    IF sy-subrc <> 0 OR lv_answer <> '1'.
+      RETURN.
+    ENDIF.
+
+    DATA lt_runs TYPE SORTED TABLE OF sysuuid_c32 WITH UNIQUE KEY table_line.
+    LOOP AT lt_cand ASSIGNING FIELD-SYMBOL(<sm>).
+      DELETE FROM zptp_301_res_log
+        WHERE aufnr  = @<sm>-aufnr AND res_kind = @<sm>-res_kind
+          AND posnr  = @<sm>-posnr AND run_id   = @<sm>-run_id
+          AND status = @<sm>-status.
+      INSERT <sm>-run_id INTO TABLE lt_runs.
+    ENDLOOP.
+
+    " run log : runs of these rows that have no item row left
+    DATA lv_runs TYPE i.
+    LOOP AT lt_runs ASSIGNING FIELD-SYMBOL(<ru>).
+      SELECT SINGLE run_id FROM zptp_301_res_log INTO @DATA(lv_left) WHERE run_id = @<ru>.
+      IF sy-subrc <> 0.
+        DELETE FROM zptp_301_run_log WHERE run_id = @<ru>.
+        lv_runs = lv_runs + 1.
+      ENDIF.
+    ENDLOOP.
+    COMMIT WORK.
+
+    MESSAGE |{ lines( lt_cand ) } item log rows deleted ({ lv_kept } link rows kept), { lv_runs } runs deleted from the run log| TYPE 'S'.
+    rv_done = abap_true.
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+  METHOD purge_history.
+    " Deletes the log rows older than P_PDATE, restricted to the production order
+    " and reservation of the selection (empty selection = all), with two safeguards:
+    "   - item log    : the LATEST row of every item is kept, even if it is older
+    "                   (the generator finds its reservations through it);
+    "   - transfer log: the rows of 301 postings that are not reversed are kept
+    "                   (the reservation manager needs them to reverse the posting);
+    "   - run log     : runs started before the date that have no item row left.
+
+    " 1) item log : rows older than the date, except the latest row of each item
+    SELECT aufnr, res_kind, posnr, rsnum, rspos, run_id, erdat, erzet
+      FROM zptp_301_res_log
+      WHERE aufnr IN @so_aufnr
+        AND rsnum IN @so_rsnum
+      INTO TABLE @DATA(lt_rl).
+    SORT lt_rl BY aufnr res_kind posnr rsnum rspos erdat DESCENDING erzet DESCENDING.
+
+    DATA lt_del_res LIKE lt_rl.
+    DATA(lv_prev) = VALUE string( ).
+    LOOP AT lt_rl ASSIGNING FIELD-SYMBOL(<rl>).
+      DATA(lv_item) = |{ <rl>-aufnr }{ <rl>-res_kind }{ <rl>-posnr }{ <rl>-rsnum }{ <rl>-rspos }|.
+      IF lv_item <> lv_prev.
+        lv_prev = lv_item.                              " newest row of the item: kept
+        CONTINUE.
+      ENDIF.
+      IF <rl>-erdat < p_pdate.
+        APPEND <rl> TO lt_del_res.
+      ENDIF.
+    ENDLOOP.
+
+    " 2) transfer log : rows older than the date, except active 301 postings
+    SELECT rsnum, rspos, erdat, erzet, status, mov_mblnr, mov_mjahr
+      FROM zptp_301_trf_log
+      WHERE erdat <  @p_pdate
+        AND aufnr IN @so_aufnr
+        AND rsnum IN @so_rsnum
+      INTO TABLE @DATA(lt_tl).
+    DATA(lt_tl_doc) = lt_tl.
+    DELETE lt_tl_doc WHERE status <> 'S' OR mov_mblnr IS INITIAL.
+    IF lt_tl_doc IS NOT INITIAL.
+      SELECT smbln, sjahr FROM mseg
+        FOR ALL ENTRIES IN @lt_tl_doc
+        WHERE smbln = @lt_tl_doc-mov_mblnr
+          AND sjahr = @lt_tl_doc-mov_mjahr
+        INTO TABLE @DATA(lt_cancel).
+    ENDIF.
+    DATA lt_del_trf LIKE lt_tl.
+    LOOP AT lt_tl ASSIGNING FIELD-SYMBOL(<tl>).
+      IF <tl>-status = 'S' AND <tl>-mov_mblnr IS NOT INITIAL
+         AND NOT line_exists( lt_cancel[ smbln = <tl>-mov_mblnr sjahr = <tl>-mov_mjahr ] ).
+        CONTINUE.                                       " active posting: kept
+      ENDIF.
+      APPEND <tl> TO lt_del_trf.
+    ENDLOOP.
+
+    " 3) confirmation
+    DATA lv_answer TYPE c LENGTH 1.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = 'Delete history before date'
+        text_question         = |{ lines( lt_del_res ) } item log rows and { lines( lt_del_trf ) } transfer log rows before { p_pdate DATE = USER } will be deleted, then the runs left without item rows. Not restorable. Continue?|
+        text_button_1         = 'Continue'
+        text_button_2         = 'Cancel run'
+        icon_button_1         = 'ICON_OKAY'
+        icon_button_2         = 'ICON_CANCEL'
+        default_button        = '2'
+        display_cancel_button = abap_false
+        popup_type            = 'ICON_MESSAGE_WARNING'
+      IMPORTING
+        answer                = lv_answer
+      EXCEPTIONS
+        OTHERS                = 1.
+    IF sy-subrc <> 0 OR lv_answer <> '1'.
+      RETURN.
+    ENDIF.
+
+    " 4) deletion
+    LOOP AT lt_del_res ASSIGNING <rl>.
+      DELETE FROM zptp_301_res_log
+        WHERE aufnr = @<rl>-aufnr AND res_kind = @<rl>-res_kind
+          AND posnr = @<rl>-posnr AND run_id   = @<rl>-run_id.
+    ENDLOOP.
+    LOOP AT lt_del_trf ASSIGNING <tl>.
+      DELETE FROM zptp_301_trf_log
+        WHERE rsnum = @<tl>-rsnum AND rspos = @<tl>-rspos
+          AND erdat = @<tl>-erdat AND erzet = @<tl>-erzet.
+    ENDLOOP.
+
+    DATA lv_runs TYPE i.
+    SELECT run_id FROM zptp_301_run_log WHERE start_date < @p_pdate INTO TABLE @DATA(lt_old_runs).
+    LOOP AT lt_old_runs ASSIGNING FIELD-SYMBOL(<or>).
+      SELECT SINGLE run_id FROM zptp_301_res_log INTO @DATA(lv_left) WHERE run_id = @<or>-run_id.
+      IF sy-subrc <> 0.
+        DELETE FROM zptp_301_run_log WHERE run_id = @<or>-run_id.
+        lv_runs = lv_runs + 1.
+      ENDIF.
+    ENDLOOP.
+    COMMIT WORK.
+
+    MESSAGE |History before { p_pdate DATE = USER } deleted: { lines( lt_del_res ) } item log, { lines( lt_del_trf ) } transfer log, { lv_runs } run log rows| TYPE 'S'.
+    rv_done = abap_true.
   ENDMETHOD.
 
 *---------------------------------------------------------------------*
@@ -387,6 +636,9 @@ CLASS lcl_app IMPLEMENTATION.
           IF <t>-status <> 'S' OR <t>-mov_mblnr IS INITIAL.
             CONTINUE.
           ENDIF.
+          " latest posting (rows sorted by date / time): transfer run ID and date
+          ls_out-trf_run  = <t>-run_id.
+          ls_out-trf_date = <t>-erdat.
           IF NOT line_exists( lt_dk_ok[ mblnr = <t>-mov_mblnr mjahr = <t>-mov_mjahr ] ).
             lv_red = abap_true.
             APPEND |Material document { <t>-mov_mblnr }/{ <t>-mov_mjahr } of the transfer log not found in MSEG| TO lt_txt.
@@ -651,6 +903,8 @@ CLASS lcl_app IMPLEMENTATION.
     _col 'N_RUN'      'Runs in run log'  6.
     _col 'LAST_RUN'   'Last run ID'      34.
     _col 'LAST_DATE'  'Last date'        10.
+    _col 'TRF_RUN'    'Last transfer run ID' 34.
+    _col 'TRF_DATE'   'Last posting date' 10.
     _col 'CHECK_TXT'  'Consistency check' 80.
 
     LOOP AT lt_fcat ASSIGNING FIELD-SYMBOL(<f>).
@@ -714,6 +968,12 @@ FORM user_command USING pv_ucomm    LIKE sy-ucomm
   ps_selfield-col_stable = abap_true.
   ps_selfield-row_stable = abap_true.
 ENDFORM.
+
+*---------------------------------------------------------------------*
+INITIALIZATION.
+  " Delete rows by status: S (simulated) and K (skipped) proposed
+  so_stat[] = VALUE #( ( sign = 'I' option = 'EQ' low = 'S' )
+                       ( sign = 'I' option = 'EQ' low = 'K' ) ).
 
 *---------------------------------------------------------------------*
 START-OF-SELECTION.
