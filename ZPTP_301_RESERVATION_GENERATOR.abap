@@ -738,10 +738,18 @@ CLASS lcl_app IMPLEMENTATION.
     ENDIF.
 
     " Open component requirements of the production order.
-    " POSTP = 'L' -> stock item only (excludes non-stock 'N', text 'T', phantom).
+    " They are read through the reservation number of the order (AFKO-RSNUM), so
+    " that RESB is accessed by its primary key (RSNUM): on HANA there is no
+    " index on RESB-AUFNR. POSTP = 'L' -> stock item only (excludes non-stock 'N',
+    " text 'T', phantom).
+    SELECT SINGLE rsnum FROM afko INTO @DATA(lv_ord_rsnum) WHERE aufnr = @is_order-aufnr.
+    IF lv_ord_rsnum IS INITIAL.
+      RETURN.                          " order without components
+    ENDIF.
     SELECT rspos, matnr, bdmng, enmng, meins, werks, bdter, charg, lgort
       FROM resb INTO TABLE @DATA(lt_comp)
-      WHERE aufnr = @is_order-aufnr
+      WHERE rsnum = @lv_ord_rsnum
+        AND aufnr = @is_order-aufnr
         AND werks = @p_werkrt          " requirement at the production plant
         AND matnr <> @space
         AND postp = 'L'                " stock item
@@ -980,7 +988,8 @@ CLASS lcl_app IMPLEMENTATION.
       <u>-upl_by   = sy-uname.
     ENDLOOP.
 
-    DELETE FROM zptp_301_excl.
+    " no WHERE on purpose: the upload replaces the whole list
+    DELETE FROM zptp_301_excl.                                   "#EC CI_NOWHERE
     INSERT zptp_301_excl FROM TABLE @( VALUE #( FOR u IN lt_new ( u ) ) ).
     COMMIT WORK.
     MESSAGE |Exclusion list uploaded: { lines( lt_new ) } orders| TYPE 'S'.

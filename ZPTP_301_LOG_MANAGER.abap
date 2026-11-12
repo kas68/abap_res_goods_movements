@@ -398,9 +398,10 @@ CLASS lcl_app IMPLEMENTATION.
   METHOD clear_logs.
     " Deletes ALL rows of the item log, the transfer log and the run log,
     " whatever the selection. The user must confirm.
-    SELECT COUNT(*) FROM zptp_301_res_log INTO @DATA(lv_res).
-    SELECT COUNT(*) FROM zptp_301_trf_log INTO @DATA(lv_trf).
-    SELECT COUNT(*) FROM zptp_301_run_log INTO @DATA(lv_run).
+    " No WHERE on purpose: the option counts and empties the whole tables.
+    SELECT COUNT(*) FROM zptp_301_res_log INTO @DATA(lv_res).    "#EC CI_NOWHERE
+    SELECT COUNT(*) FROM zptp_301_trf_log INTO @DATA(lv_trf).    "#EC CI_NOWHERE
+    SELECT COUNT(*) FROM zptp_301_run_log INTO @DATA(lv_run).    "#EC CI_NOWHERE
 
     DATA lv_answer TYPE c LENGTH 1.
     CALL FUNCTION 'POPUP_TO_CONFIRM'
@@ -422,9 +423,9 @@ CLASS lcl_app IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    DELETE FROM zptp_301_res_log.
-    DELETE FROM zptp_301_trf_log.
-    DELETE FROM zptp_301_run_log.
+    DELETE FROM zptp_301_res_log.                                "#EC CI_NOWHERE
+    DELETE FROM zptp_301_trf_log.                                "#EC CI_NOWHERE
+    DELETE FROM zptp_301_run_log.                                "#EC CI_NOWHERE
     COMMIT WORK.
     MESSAGE |All logs deleted: { lv_res } item log, { lv_trf } transfer log, { lv_run } run log rows| TYPE 'S'.
     rv_done = abap_true.
